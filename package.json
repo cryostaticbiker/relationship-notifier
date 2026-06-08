@@ -4,11 +4,7 @@
   "description": "A Revenge/Vendetta plugin that notifies when friends or servers disappear.",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=iife --global-name=relationshipNotifier --outfile=dist/index.js --external:@vendetta/* --external:react --external:react-native",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "esbuild": "^0.25.0",
-    "typescript": "^6.0.0"
+    "build": "node scripts/build.mjs",
+    "verify:local": "node scripts/verify-install-url.mjs file://$PWD/dist/"
   }
 }
