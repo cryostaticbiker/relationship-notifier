@@ -1,0 +1,15 @@
+{
+  "name": "Relationship Notifier",
+  "description": "Stores your friends and servers, then sends an Android notification if someone unfriends you or you are removed from a server.",
+  "authors": [
+    {
+      "name": "OpenAI",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_notification"
+  },
+  "hash": "3e28e783ca3847e4eff1410f699d09cf8f8723efe00f87935c6231d1ea745990"
+}
