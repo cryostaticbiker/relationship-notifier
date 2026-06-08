@@ -1,0 +1,10 @@
+{
+  "name": "relationship-notifier",
+  "version": "1.0.0",
+  "description": "A Revenge/Vendetta plugin that notifies when friends or servers disappear.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "verify:local": "node scripts/verify-install-url.mjs file://$PWD/dist/"
+  }
+}

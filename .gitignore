@@ -1,0 +1,7 @@
+node_modules/
+dist/*
+!dist/
+!dist/index.js
+!dist/manifest.json
+*.tsbuildinfo
+.DS_Store
