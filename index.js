@@ -1,60 +1,46 @@
 (() => {
   const PLUGIN_NAME = "Relationship Notifier";
-  const STORAGE_VERSION = 1;
-  const FRIEND_RELATIONSHIP_TYPE = 1;
-  const SCAN_INTERVAL_MS = 60_000;
-  const RESCAN_DELAY_MS = 1_000;
-  const NOTIFICATION_CHANNEL_ID = "relationship-notifier";
+  const STORAGE_VERSION = 3;
+  const FRIEND_TYPE = 1;
+  const SCAN_EVERY_MS = 60_000;
+  const DEBOUNCE_MS = 750;
+  const MAX_CHANGES = 250;
+  const CHANNEL_ID = "relationship-notifier";
 
-  const storage = vendetta.plugin.storage;
-  const metro = vendetta.metro;
-  const common = metro.common ?? {};
-  const FluxDispatcher = common.FluxDispatcher;
-  const ReactNative = common.ReactNative;
-  const showToast = vendetta.ui?.toasts?.showToast ?? (() => undefined);
-  const logger = vendetta.logger ?? console;
+  const { metro, plugin, ui } = vendetta;
+  const storage = plugin.storage;
+  const React = metro.common?.React;
+  const ReactNative = metro.common?.ReactNative;
+  const FluxDispatcher = metro.common?.FluxDispatcher;
+  const showToast = ui?.toasts?.showToast ?? (() => undefined);
 
-  let scanTimer;
-  let rescanTimer;
+  let interval;
+  let debounce;
+  const listeners = [];
 
-  const subscriptions = [];
-
-  function timestamp() {
-    return Date.now();
-  }
-
-  function getStore(name, fallbackProps) {
-    if (typeof metro.findByStoreName === "function") {
-      const store = metro.findByStoreName(name);
-      if (store) return store;
-    }
-
-    return metro.findByProps?.(...fallbackProps);
-  }
-
-  const RelationshipStore = getStore("RelationshipStore", ["getRelationships"]);
-  const UserStore = getStore("UserStore", ["getUser", "getCurrentUser"]);
-  const GuildStore = getStore("GuildStore", ["getGuilds", "getGuild"]);
+  const byStore = (name, ...props) => metro.findByStoreName?.(name) ?? metro.findByProps?.(...props);
+  const RelationshipStore = byStore("RelationshipStore", "getRelationships");
+  const UserStore = byStore("UserStore", "getUser");
+  const GuildStore = byStore("GuildStore", "getGuilds");
 
   function ensureStorage() {
-    storage.version ??= STORAGE_VERSION;
+    storage.version = STORAGE_VERSION;
     storage.friends ??= {};
     storage.guilds ??= {};
-    storage.initializedAt ??= 0;
+    storage.ready ??= false;
     storage.lastScanAt ??= 0;
-    storage.notifyOnUnfriends ??= true;
-    storage.notifyOnGuildRemoval ??= true;
+    storage.changes ??= [];
   }
 
-  function displayNameForUser(user, fallbackId) {
-    return user?.globalName ?? user?.global_name ?? user?.displayName ?? user?.username ?? user?.tag ?? fallbackId;
+  function labelUser(user, id) {
+    return user?.globalName ?? user?.global_name ?? user?.displayName ?? user?.username ?? user?.tag ?? id;
   }
 
-  function displayNameForGuild(guild, fallbackId) {
-    return guild?.name ?? guild?.properties?.name ?? fallbackId;
+  function labelGuild(guild, id) {
+    return guild?.name ?? guild?.properties?.name ?? id;
   }
 
-  function getFriendIds() {
+  function friendIds() {
     if (typeof RelationshipStore?.getFriendIDs === "function") return RelationshipStore.getFriendIDs();
     if (typeof RelationshipStore?.getFriendIds === "function") return RelationshipStore.getFriendIds();
 
@@ -62,219 +48,224 @@
       typeof RelationshipStore?.getRelationships === "function" ? RelationshipStore.getRelationships() : {};
 
     return Object.entries(relationships)
-      .filter(([, type]) => type === FRIEND_RELATIONSHIP_TYPE)
+      .filter(([, relationship]) => relationship === FRIEND_TYPE)
       .map(([id]) => id);
   }
 
-  function getGuilds() {
-    return typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
-  }
-
-  function snapshotFriends() {
+  function currentFriends() {
+    const seenAt = Date.now();
     return Object.fromEntries(
-      getFriendIds().map((id) => [
-        id,
-        {
-          id,
-          name: displayNameForUser(UserStore?.getUser?.(id), id),
-          recordedAt: timestamp(),
-        },
-      ]),
+      friendIds().map((id) => [id, { id, label: labelUser(UserStore?.getUser?.(id), id), seenAt }]),
     );
   }
 
-  function snapshotGuilds() {
+  function currentGuilds() {
+    const seenAt = Date.now();
+    const guilds = typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
+
     return Object.fromEntries(
-      Object.entries(getGuilds()).map(([id, guild]) => [
-        id,
-        {
-          id,
-          name: displayNameForGuild(guild, id),
-          recordedAt: timestamp(),
-        },
-      ]),
+      Object.entries(guilds).map(([id, guild]) => [id, { id, label: labelGuild(guild, id), seenAt }]),
     );
   }
 
-  function findRemoved(previous, current) {
-    return Object.values(previous ?? {}).filter((entity) => !current[entity.id]);
-  }
+  function compare(kind, previous, next) {
+    const changedAt = Date.now();
+    const changes = [];
 
-  function saveSnapshot(friends, guilds) {
-    storage.friends = friends;
-    storage.guilds = guilds;
-    storage.lastScanAt = timestamp();
-  }
-
-  function findNotificationModule() {
-    const candidates = [
-      metro.findByProps?.("displayNotification"),
-      metro.findByProps?.("showNotification"),
-      metro.findByProps?.("presentLocalNotification"),
-      metro.findByProps?.("localNotification"),
-      ReactNative?.NativeModules?.Notifications,
-      ReactNative?.NativeModules?.NotificationManager,
-    ];
-
-    const methods = [
-      "displayNotification",
-      "showNotification",
-      "presentLocalNotification",
-      "localNotification",
-      "scheduleLocalNotification",
-      "notify",
-    ];
-
-    for (const module of candidates) {
-      if (!module) continue;
-
-      for (const method of methods) {
-        if (typeof module[method] === "function") return { module, method };
+    for (const entry of Object.values(next)) {
+      if (!previous?.[entry.id]) {
+        changes.push({ ...entry, kind, action: "added", changedAt, changeId: `${kind}:added:${entry.id}:${changedAt}` });
       }
     }
+
+    for (const entry of Object.values(previous ?? {})) {
+      if (!next[entry.id]) {
+        changes.push({ ...entry, kind, action: "removed", changedAt, changeId: `${kind}:removed:${entry.id}:${changedAt}` });
+      }
+    }
+
+    return changes;
   }
 
-  function notificationText(kind, entity) {
-    if (kind === "friend") {
+  function notificationText(change) {
+    if (change.kind === "friend") {
       return {
-        title: "Friend removed",
-        body: `${entity.name} is no longer in your friends list.`,
+        title: change.action === "added" ? "Mutual added" : "Mutual removed",
+        body:
+          change.action === "added"
+            ? `${change.label} is now in your friends list.`
+            : `${change.label} removed you from their friends list.`,
       };
     }
 
     return {
-      title: "Server removed",
-      body: `You are no longer in ${entity.name}.`,
+      title: change.action === "added" ? "Server added" : "Server removed",
+      body: change.action === "added" ? `You were added to ${change.label}.` : `You were removed from ${change.label}.`,
     };
   }
 
-  function notify(kind, entity) {
-    const { title, body } = notificationText(kind, entity);
-    const payload = {
-      title,
-      body,
-      message: body,
-      channelId: NOTIFICATION_CHANNEL_ID,
-      identifier: `${NOTIFICATION_CHANNEL_ID}-${kind}-${entity.id}-${timestamp()}`,
-      smallIcon: "ic_notification",
-      userInfo: {
-        plugin: NOTIFICATION_CHANNEL_ID,
-        kind,
-        id: entity.id,
-      },
-    };
+  function notificationModule() {
+    const modules = [
+      metro.findByProps?.("displayNotification"),
+      metro.findByProps?.("showNotification"),
+      metro.findByProps?.("presentLocalNotification"),
+      ReactNative?.NativeModules?.Notifications,
+    ];
+    const methods = ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"];
 
-    try {
-      const notificationModule = findNotificationModule();
-      if (notificationModule) {
-        notificationModule.module[notificationModule.method].call(notificationModule.module, payload);
-        return;
+    for (const module of modules) {
+      for (const method of methods) {
+        if (typeof module?.[method] === "function") return { module, method };
       }
-    } catch (error) {
-      logger.warn?.(`[${PLUGIN_NAME}] Native notification failed`, error);
+    }
+  }
+
+  function notify(change) {
+    const { title, body } = notificationText(change);
+    const target = notificationModule();
+
+    if (target) {
+      target.module[target.method].call(target.module, {
+        title,
+        body,
+        message: body,
+        channelId: CHANNEL_ID,
+        identifier: change.changeId,
+        smallIcon: "ic_notification",
+      });
+      return;
     }
 
     showToast(`${title}: ${body}`);
   }
 
+  function recordChanges(changes) {
+    if (!changes.length) return;
+    storage.changes = [...changes, ...(storage.changes ?? [])].slice(0, MAX_CHANGES);
+    changes.forEach(notify);
+  }
+
+  function writeSnapshot(friends, guilds) {
+    storage.friends = friends;
+    storage.guilds = guilds;
+    storage.ready = true;
+    storage.lastScanAt = Date.now();
+  }
+
   function scan({ silent = false } = {}) {
     ensureStorage();
+    const friends = currentFriends();
+    const guilds = currentGuilds();
 
-    const friends = snapshotFriends();
-    const guilds = snapshotGuilds();
-
-    if (!storage.initializedAt) {
-      storage.initializedAt = timestamp();
-      saveSnapshot(friends, guilds);
-      logger.log?.(`[${PLUGIN_NAME}] Stored initial relationship baseline.`);
-      return;
+    if (storage.ready && !silent) {
+      recordChanges([...compare("friend", storage.friends, friends), ...compare("guild", storage.guilds, guilds)]);
     }
 
-    if (!silent) {
-      if (storage.notifyOnUnfriends) {
-        for (const friend of findRemoved(storage.friends, friends)) notify("friend", friend);
-      }
-
-      if (storage.notifyOnGuildRemoval) {
-        for (const guild of findRemoved(storage.guilds, guilds)) notify("guild", guild);
-      }
-    }
-
-    saveSnapshot(friends, guilds);
+    writeSnapshot(friends, guilds);
   }
 
-  function scheduleScan(options) {
-    clearTimeout(rescanTimer);
-    rescanTimer = setTimeout(() => scan(options), RESCAN_DELAY_MS);
-  }
-
-  function eventId(event) {
-    return event?.relationship?.id ?? event?.user?.id ?? event?.userId ?? event?.guild?.id ?? event?.guildId ?? event?.id;
-  }
-
-  function handleRelationshipRemove(event) {
-    const id = eventId(event);
-    const friend = id ? storage.friends?.[id] : undefined;
-
-    if (storage.notifyOnUnfriends && friend) {
-      notify("friend", friend);
-      delete storage.friends[id];
-    }
-
-    scheduleScan({ silent: true });
-  }
-
-  function handleGuildDelete(event) {
-    if (event?.guild?.unavailable || event?.unavailable) {
-      scheduleScan({ silent: true });
-      return;
-    }
-
-    const id = eventId(event);
-    const guild = id ? storage.guilds?.[id] : undefined;
-
-    if (storage.notifyOnGuildRemoval && guild) {
-      notify("guild", guild);
-      delete storage.guilds[id];
-    }
-
-    scheduleScan({ silent: true });
+  function scheduleScan() {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => scan({ silent: false }), DEBOUNCE_MS);
   }
 
   function subscribe(event, handler) {
     FluxDispatcher?.subscribe?.(event, handler);
-    subscriptions.push([event, handler]);
+    listeners.push([event, handler]);
   }
 
   function unsubscribeAll() {
-    for (const [event, handler] of subscriptions.splice(0)) {
-      FluxDispatcher?.unsubscribe?.(event, handler);
-    }
+    for (const [event, handler] of listeners.splice(0)) FluxDispatcher?.unsubscribe?.(event, handler);
   }
 
-  function resyncBaseline() {
-    scan({ silent: true });
-    showToast(`${PLUGIN_NAME}: baseline refreshed.`);
+  function matchesFilter(change, filter) {
+    if (filter === "all") return true;
+    if (filter === "friend" || filter === "guild") return change.kind === filter;
+    const [kind, action] = filter.split("-");
+    return change.kind === kind && change.action === action;
+  }
+
+  function ChangeLogSettings() {
+    ensureStorage();
+    const [filter, setFilter] = React.useState("all");
+    const changes = (storage.changes ?? []).filter((change) => matchesFilter(change, filter));
+    const filters = [
+      ["all", "All"],
+      ["friend", "Mutuals"],
+      ["friend-added", "Mutual adds"],
+      ["friend-removed", "Mutual removals"],
+      ["guild", "Servers"],
+      ["guild-added", "Server adds"],
+      ["guild-removed", "Server removals"],
+    ];
+    const e = React.createElement;
+    const { ScrollView, View, Text, Pressable } = ReactNative;
+
+    return e(
+      ScrollView,
+      { style: { padding: 16 } },
+      e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
+      e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
+      e(
+        View,
+        { style: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 } },
+        ...filters.map(([value, label]) =>
+          e(
+            Pressable,
+            {
+              key: value,
+              onPress: () => setFilter(value),
+              style: {
+                backgroundColor: filter === value ? "#5865f2" : "#2f3136",
+                borderRadius: 16,
+                paddingHorizontal: 12,
+                paddingVertical: 8,
+              },
+            },
+            e(Text, { style: { color: "white", fontWeight: "600" } }, label),
+          ),
+        ),
+      ),
+      changes.length
+        ? changes.map((change) => {
+            const { title, body } = notificationText(change);
+            return e(
+              View,
+              { key: change.changeId, style: { backgroundColor: "#2f3136", borderRadius: 12, marginBottom: 10, padding: 12 } },
+              e(Text, { style: { color: "white", fontWeight: "700", marginBottom: 4 } }, title),
+              e(Text, { style: { color: "#dcddde", marginBottom: 6 } }, body),
+              e(Text, { style: { color: "#8e9297", fontSize: 12 } }, new Date(change.changedAt).toLocaleString()),
+            );
+          })
+        : e(Text, { style: { color: "#b9bbbe" } }, "No changes recorded for this filter yet."),
+    );
   }
 
   return {
     onLoad() {
       ensureStorage();
-      subscribe("RELATIONSHIP_REMOVE", handleRelationshipRemove);
-      subscribe("GUILD_DELETE", handleGuildDelete);
-      subscribe("CONNECTION_OPEN", () => scheduleScan({ silent: true }));
+      subscribe("RELATIONSHIP_ADD", scheduleScan);
+      subscribe("RELATIONSHIP_REMOVE", scheduleScan);
+      subscribe("GUILD_CREATE", scheduleScan);
+      subscribe("GUILD_DELETE", scheduleScan);
+      subscribe("CONNECTION_OPEN", scheduleScan);
       scan({ silent: false });
-      scanTimer = setInterval(scan, SCAN_INTERVAL_MS);
+      interval = setInterval(scan, SCAN_EVERY_MS);
     },
 
     onUnload() {
       unsubscribeAll();
-      clearInterval(scanTimer);
-      clearTimeout(rescanTimer);
-      scanTimer = undefined;
-      rescanTimer = undefined;
+      clearInterval(interval);
+      clearTimeout(debounce);
+      interval = undefined;
+      debounce = undefined;
     },
 
-    resyncBaseline,
+    settings: ChangeLogSettings,
+
+    resyncBaseline() {
+      scan({ silent: true });
+      showToast(`${PLUGIN_NAME}: baseline refreshed.`);
+    },
   };
 })();
