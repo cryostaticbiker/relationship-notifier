@@ -13,6 +13,7 @@ declare module "@vendetta/metro/common" {
     unsubscribe?: (event: string, callback: (event: any) => void) => void;
     dispatch?: (event: Record<string, unknown>) => void;
   };
+  export const React: any;
   export const ReactNative: any;
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "Relationship Notifier",
-  "description": "Notifies when a friend or server disappears from your Discord client snapshot.",
+  "description": "Sends mobile notifications and keeps a filterable log when mutuals or servers are added or removed.",
   "authors": [
     {
       "name": "cryostaticbiker",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_notification"
   },
-  "hash": "cda75683c3fb2a89af1d19907ec4d13ed2dcda16a1347c8eae6921de9c389ae9"
+  "hash": "b1b0d89d8a051b47c6835c79287a8d44a5e6c1559af251fa07a195297bc4e251"
 }

@@ -1,15 +1,17 @@
 (() => {
   const PLUGIN_NAME = "Relationship Notifier";
-  const STORAGE_VERSION = 2;
+  const STORAGE_VERSION = 3;
   const FRIEND_TYPE = 1;
   const SCAN_EVERY_MS = 60_000;
-  const DEBOUNCE_MS = 1_000;
+  const DEBOUNCE_MS = 750;
+  const MAX_CHANGES = 250;
   const CHANNEL_ID = "relationship-notifier";
 
-  const { metro, plugin, ui, logger = console } = vendetta;
+  const { metro, plugin, ui } = vendetta;
   const storage = plugin.storage;
-  const FluxDispatcher = metro.common?.FluxDispatcher;
+  const React = metro.common?.React;
   const ReactNative = metro.common?.ReactNative;
+  const FluxDispatcher = metro.common?.FluxDispatcher;
   const showToast = ui?.toasts?.showToast ?? (() => undefined);
 
   let interval;
@@ -27,6 +29,7 @@
     storage.guilds ??= {};
     storage.ready ??= false;
     storage.lastScanAt ??= 0;
+    storage.changes ??= [];
   }
 
   function labelUser(user, id) {
@@ -65,10 +68,40 @@
     );
   }
 
-  function removals(kind, previous, next) {
-    return Object.values(previous ?? {})
-      .filter((entry) => !next[entry.id])
-      .map((entry) => ({ kind, entry }));
+  function compare(kind, previous, next) {
+    const changedAt = Date.now();
+    const changes = [];
+
+    for (const entry of Object.values(next)) {
+      if (!previous?.[entry.id]) {
+        changes.push({ ...entry, kind, action: "added", changedAt, changeId: `${kind}:added:${entry.id}:${changedAt}` });
+      }
+    }
+
+    for (const entry of Object.values(previous ?? {})) {
+      if (!next[entry.id]) {
+        changes.push({ ...entry, kind, action: "removed", changedAt, changeId: `${kind}:removed:${entry.id}:${changedAt}` });
+      }
+    }
+
+    return changes;
+  }
+
+  function notificationText(change) {
+    if (change.kind === "friend") {
+      return {
+        title: change.action === "added" ? "Mutual added" : "Mutual removed",
+        body:
+          change.action === "added"
+            ? `${change.label} is now in your friends list.`
+            : `${change.label} removed you from their friends list.`,
+      };
+    }
+
+    return {
+      title: change.action === "added" ? "Server added" : "Server removed",
+      body: change.action === "added" ? `You were added to ${change.label}.` : `You were removed from ${change.label}.`,
+    };
   }
 
   function notificationModule() {
@@ -87,31 +120,29 @@
     }
   }
 
-  function notify(removal) {
-    const isFriend = removal.kind === "friend";
-    const title = isFriend ? "Friend removed" : "Server removed";
-    const body = isFriend
-      ? `${removal.entry.label} is no longer in your friends list.`
-      : `You are no longer in ${removal.entry.label}.`;
+  function notify(change) {
+    const { title, body } = notificationText(change);
+    const target = notificationModule();
 
-    try {
-      const target = notificationModule();
-      if (target) {
-        target.module[target.method].call(target.module, {
-          title,
-          body,
-          message: body,
-          channelId: CHANNEL_ID,
-          identifier: `${CHANNEL_ID}-${removal.kind}-${removal.entry.id}-${Date.now()}`,
-          smallIcon: "ic_notification",
-        });
-        return;
-      }
-    } catch (error) {
-      logger.warn?.(`[${PLUGIN_NAME}] Failed to show native notification`, error);
+    if (target) {
+      target.module[target.method].call(target.module, {
+        title,
+        body,
+        message: body,
+        channelId: CHANNEL_ID,
+        identifier: change.changeId,
+        smallIcon: "ic_notification",
+      });
+      return;
     }
 
     showToast(`${title}: ${body}`);
+  }
+
+  function recordChanges(changes) {
+    if (!changes.length) return;
+    storage.changes = [...changes, ...(storage.changes ?? [])].slice(0, MAX_CHANGES);
+    changes.forEach(notify);
   }
 
   function writeSnapshot(friends, guilds) {
@@ -127,38 +158,15 @@
     const guilds = currentGuilds();
 
     if (storage.ready && !silent) {
-      for (const removal of [...removals("friend", storage.friends, friends), ...removals("guild", storage.guilds, guilds)]) {
-        notify(removal);
-      }
+      recordChanges([...compare("friend", storage.friends, friends), ...compare("guild", storage.guilds, guilds)]);
     }
 
     writeSnapshot(friends, guilds);
   }
 
-  function scheduleSilentScan() {
+  function scheduleScan() {
     clearTimeout(debounce);
-    debounce = setTimeout(() => scan({ silent: true }), DEBOUNCE_MS);
-  }
-
-  function eventId(event) {
-    return event?.relationship?.id ?? event?.user?.id ?? event?.userId ?? event?.guild?.id ?? event?.guildId ?? event?.id;
-  }
-
-  function handleRelationshipRemove(event) {
-    const entry = storage.friends?.[eventId(event)];
-    if (entry) notify({ kind: "friend", entry });
-    scheduleSilentScan();
-  }
-
-  function handleGuildDelete(event) {
-    if (event?.guild?.unavailable || event?.unavailable) {
-      scheduleSilentScan();
-      return;
-    }
-
-    const entry = storage.guilds?.[eventId(event)];
-    if (entry) notify({ kind: "guild", entry });
-    scheduleSilentScan();
+    debounce = setTimeout(() => scan({ silent: false }), DEBOUNCE_MS);
   }
 
   function subscribe(event, handler) {
@@ -170,12 +178,77 @@
     for (const [event, handler] of listeners.splice(0)) FluxDispatcher?.unsubscribe?.(event, handler);
   }
 
+  function matchesFilter(change, filter) {
+    if (filter === "all") return true;
+    if (filter === "friend" || filter === "guild") return change.kind === filter;
+    const [kind, action] = filter.split("-");
+    return change.kind === kind && change.action === action;
+  }
+
+  function ChangeLogSettings() {
+    ensureStorage();
+    const [filter, setFilter] = React.useState("all");
+    const changes = (storage.changes ?? []).filter((change) => matchesFilter(change, filter));
+    const filters = [
+      ["all", "All"],
+      ["friend", "Mutuals"],
+      ["friend-added", "Mutual adds"],
+      ["friend-removed", "Mutual removals"],
+      ["guild", "Servers"],
+      ["guild-added", "Server adds"],
+      ["guild-removed", "Server removals"],
+    ];
+    const e = React.createElement;
+    const { ScrollView, View, Text, Pressable } = ReactNative;
+
+    return e(
+      ScrollView,
+      { style: { padding: 16 } },
+      e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
+      e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
+      e(
+        View,
+        { style: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 } },
+        ...filters.map(([value, label]) =>
+          e(
+            Pressable,
+            {
+              key: value,
+              onPress: () => setFilter(value),
+              style: {
+                backgroundColor: filter === value ? "#5865f2" : "#2f3136",
+                borderRadius: 16,
+                paddingHorizontal: 12,
+                paddingVertical: 8,
+              },
+            },
+            e(Text, { style: { color: "white", fontWeight: "600" } }, label),
+          ),
+        ),
+      ),
+      changes.length
+        ? changes.map((change) => {
+            const { title, body } = notificationText(change);
+            return e(
+              View,
+              { key: change.changeId, style: { backgroundColor: "#2f3136", borderRadius: 12, marginBottom: 10, padding: 12 } },
+              e(Text, { style: { color: "white", fontWeight: "700", marginBottom: 4 } }, title),
+              e(Text, { style: { color: "#dcddde", marginBottom: 6 } }, body),
+              e(Text, { style: { color: "#8e9297", fontSize: 12 } }, new Date(change.changedAt).toLocaleString()),
+            );
+          })
+        : e(Text, { style: { color: "#b9bbbe" } }, "No changes recorded for this filter yet."),
+    );
+  }
+
   return {
     onLoad() {
       ensureStorage();
-      subscribe("RELATIONSHIP_REMOVE", handleRelationshipRemove);
-      subscribe("GUILD_DELETE", handleGuildDelete);
-      subscribe("CONNECTION_OPEN", scheduleSilentScan);
+      subscribe("RELATIONSHIP_ADD", scheduleScan);
+      subscribe("RELATIONSHIP_REMOVE", scheduleScan);
+      subscribe("GUILD_CREATE", scheduleScan);
+      subscribe("GUILD_DELETE", scheduleScan);
+      subscribe("CONNECTION_OPEN", scheduleScan);
       scan({ silent: false });
       interval = setInterval(scan, SCAN_EVERY_MS);
     },
@@ -187,6 +260,8 @@
       interval = undefined;
       debounce = undefined;
     },
+
+    settings: ChangeLogSettings,
 
     resyncBaseline() {
       scan({ silent: true });
