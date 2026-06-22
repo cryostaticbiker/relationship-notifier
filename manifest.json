@@ -1,9 +1,9 @@
 {
   "name": "Relationship Notifier",
-  "description": "Stores your friends and servers, then sends an Android notification if someone unfriends you or you are removed from a server.",
+  "description": "Notifies when a friend or server disappears from your Discord client snapshot.",
   "authors": [
     {
-      "name": "OpenAI",
+      "name": "cryostaticbiker",
       "id": "0"
     }
   ],
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_notification"
   },
-  "hash": "3e28e783ca3847e4eff1410f699d09cf8f8723efe00f87935c6231d1ea745990"
+  "hash": "95b2ffbeedc0720fdb9715a170df64902b05d5bcd6c6f68b7f04fbde45ee2ddf"
 }
