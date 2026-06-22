@@ -187,8 +187,6 @@
         }
       } catch {}
     }
-
-    showToast(`${title}: ${body}`);
   }
 
 
