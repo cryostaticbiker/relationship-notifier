@@ -9,7 +9,7 @@ Relationship Notifier is a Revenge-compatible Discord mobile plugin that watches
 
 The plugin also adds a settings page with a filterable change log. You can view all recorded changes or filter to mutual additions, mutual removals, server additions, or server removals.
 
-> Note: mobile clients expose local notification APIs differently. The plugin tries several known native notification bridges first, then falls back to an in-app toast if the current Revenge/Discord build does not expose one.
+> Note: mobile clients expose local notification APIs differently. The plugin now tries Notifee-style, React Native local notification, and native module notification bridges first, then falls back to an in-app toast if the current Revenge/Discord build does not expose one. Because Revenge plugins run inside Discord, this is a local/mobile notification while Discord is running, not a remote APNs/FCM server push while the app is fully killed.
 
 ## Repository layout
 
@@ -119,7 +119,7 @@ Replace `YOUR_GITHUB_USERNAME` and `main` with your GitHub username and branch n
 
 ## Using the settings page
 
-Open the plugin settings in Revenge to view the change log. The available filters are:
+Open the plugin settings in Revenge to view the change log. Use **Send test notification** at the top of the settings page to confirm that your current Discord/Revenge build exposes a native notification bridge. The available filters are:
 
 - **All**: every recorded mutual and server change;
 - **Mutuals**: all mutual additions and removals;

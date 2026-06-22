@@ -109,19 +109,81 @@ function notificationText(change: ChangeRecord) {
   };
 }
 
-function notify(change: ChangeRecord) {
-  const { title, body } = notificationText(change);
-  const payload = { title, body, message: body, channelId: CHANNEL_ID, identifier: change.changeId, smallIcon: "ic_notification" };
-  const modules = [findByProps("displayNotification"), findByProps("showNotification"), findByProps("presentLocalNotification"), ReactNative?.NativeModules?.Notifications];
-  const methods = ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"];
+async function callMaybeAsync(target: any, method: string, payload?: unknown) {
+  return await Promise.resolve(target[method](payload));
+}
 
-  for (const module of modules) {
-    for (const method of methods) {
-      if (typeof module?.[method] === "function") {
-        module[method](payload);
+function notificationTargets() {
+  const nativeModules = ReactNative?.NativeModules ?? {};
+  const directCandidates = [
+    findByProps("displayNotification"),
+    findByProps("showNotification"),
+    findByProps("presentLocalNotification"),
+    findByProps("localNotification"),
+    findByProps("requestPermission", "displayNotification"),
+    findByProps("createChannel", "displayNotification"),
+    nativeModules.Notifications,
+    nativeModules.NotificationManager,
+    nativeModules.PushNotificationManager,
+    nativeModules.PushNotificationIOS,
+  ];
+  const dynamicCandidates = Object.values(nativeModules).filter((module: any) =>
+    ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"].some(
+      (method) => typeof module?.[method] === "function",
+    ),
+  );
+
+  return [...directCandidates, ...dynamicCandidates].filter(Boolean);
+}
+
+async function notify(change: ChangeRecord) {
+  const { title, body } = notificationText(change);
+  const flatPayload = { title, body, message: body, channelId: CHANNEL_ID, identifier: change.changeId, smallIcon: "ic_notification" };
+  const notifeePayload = {
+    title,
+    body,
+    data: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+    android: { channelId: CHANNEL_ID, smallIcon: "ic_notification", pressAction: { id: "default" } },
+    ios: { sound: "default" },
+  };
+  const localPayload = {
+    ...flatPayload,
+    alertTitle: title,
+    alertBody: body,
+    alertAction: "view",
+    soundName: "default",
+    userInfo: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+  };
+
+  for (const target of notificationTargets()) {
+    try {
+      if (typeof target.requestPermission === "function") await callMaybeAsync(target, "requestPermission");
+      if (typeof target.requestPermissions === "function") await callMaybeAsync(target, "requestPermissions");
+      if (typeof target.createChannel === "function") {
+        await callMaybeAsync(target, "createChannel", { id: CHANNEL_ID, name: PLUGIN_NAME, importance: 4 });
+      }
+
+      if (typeof target.displayNotification === "function") {
+        await callMaybeAsync(target, "displayNotification", notifeePayload);
         return;
       }
-    }
+      if (typeof target.showNotification === "function") {
+        await callMaybeAsync(target, "showNotification", flatPayload);
+        return;
+      }
+      if (typeof target.presentLocalNotification === "function") {
+        await callMaybeAsync(target, "presentLocalNotification", localPayload);
+        return;
+      }
+      if (typeof target.localNotification === "function") {
+        await callMaybeAsync(target, "localNotification", localPayload);
+        return;
+      }
+      if (typeof target.notify === "function") {
+        await callMaybeAsync(target, "notify", flatPayload);
+        return;
+      }
+    } catch {}
   }
 
   showToast(`${title}: ${body}`);
@@ -130,7 +192,7 @@ function notify(change: ChangeRecord) {
 function recordChanges(changes: ChangeRecord[]) {
   if (!changes.length) return;
   store.changes = [...changes, ...(store.changes ?? [])].slice(0, MAX_CHANGES);
-  changes.forEach(notify);
+  changes.forEach((change) => void notify(change));
 }
 
 function writeSnapshot(friends: Snapshot, guilds: Snapshot) {
@@ -173,6 +235,18 @@ function matchesFilter(change: ChangeRecord, filter: FilterValue) {
   return change.kind === kind && change.action === action;
 }
 
+function sendTestNotification() {
+  void notify({
+    id: "test",
+    label: PLUGIN_NAME,
+    seenAt: Date.now(),
+    changeId: `test:${Date.now()}`,
+    kind: "friend",
+    action: "removed",
+    changedAt: Date.now(),
+  });
+}
+
 function ChangeLogSettings() {
   ensureStorage();
   const [filter, setFilter] = React.useState("all" as FilterValue);
@@ -195,6 +269,11 @@ function ChangeLogSettings() {
     { style: { padding: 16 } },
     e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
     e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
+    e(
+      Pressable,
+      { onPress: sendTestNotification, style: { backgroundColor: "#5865f2", borderRadius: 12, padding: 12, marginBottom: 12 } },
+      e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Send test notification"),
+    ),
     e(
       View,
       { style: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 } },

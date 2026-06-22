@@ -104,45 +104,96 @@
     };
   }
 
-  function notificationModule() {
-    const modules = [
+  async function callMaybeAsync(target, method, payload) {
+    return await Promise.resolve(target[method](payload));
+  }
+
+  function notificationTargets() {
+    const nativeModules = ReactNative?.NativeModules ?? {};
+    const directCandidates = [
       metro.findByProps?.("displayNotification"),
       metro.findByProps?.("showNotification"),
       metro.findByProps?.("presentLocalNotification"),
-      ReactNative?.NativeModules?.Notifications,
+      metro.findByProps?.("localNotification"),
+      metro.findByProps?.("requestPermission", "displayNotification"),
+      metro.findByProps?.("createChannel", "displayNotification"),
+      nativeModules.Notifications,
+      nativeModules.NotificationManager,
+      nativeModules.PushNotificationManager,
+      nativeModules.PushNotificationIOS,
     ];
-    const methods = ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"];
+    const dynamicCandidates = Object.values(nativeModules).filter((module) =>
+      ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"].some(
+        (method) => typeof module?.[method] === "function",
+      ),
+    );
 
-    for (const module of modules) {
-      for (const method of methods) {
-        if (typeof module?.[method] === "function") return { module, method };
-      }
-    }
+    return [...directCandidates, ...dynamicCandidates].filter(Boolean);
   }
 
-  function notify(change) {
+  async function notify(change) {
     const { title, body } = notificationText(change);
-    const target = notificationModule();
+    const flatPayload = {
+      title,
+      body,
+      message: body,
+      channelId: CHANNEL_ID,
+      identifier: change.changeId,
+      smallIcon: "ic_notification",
+    };
+    const notifeePayload = {
+      title,
+      body,
+      data: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+      android: { channelId: CHANNEL_ID, smallIcon: "ic_notification", pressAction: { id: "default" } },
+      ios: { sound: "default" },
+    };
+    const localPayload = {
+      ...flatPayload,
+      alertTitle: title,
+      alertBody: body,
+      alertAction: "view",
+      soundName: "default",
+      userInfo: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+    };
 
-    if (target) {
-      target.module[target.method].call(target.module, {
-        title,
-        body,
-        message: body,
-        channelId: CHANNEL_ID,
-        identifier: change.changeId,
-        smallIcon: "ic_notification",
-      });
-      return;
+    for (const target of notificationTargets()) {
+      try {
+        if (typeof target.requestPermission === "function") await callMaybeAsync(target, "requestPermission");
+        if (typeof target.requestPermissions === "function") await callMaybeAsync(target, "requestPermissions");
+        if (typeof target.createChannel === "function") {
+          await callMaybeAsync(target, "createChannel", { id: CHANNEL_ID, name: PLUGIN_NAME, importance: 4 });
+        }
+
+        if (typeof target.displayNotification === "function") {
+          await callMaybeAsync(target, "displayNotification", notifeePayload);
+          return;
+        }
+        if (typeof target.showNotification === "function") {
+          await callMaybeAsync(target, "showNotification", flatPayload);
+          return;
+        }
+        if (typeof target.presentLocalNotification === "function") {
+          await callMaybeAsync(target, "presentLocalNotification", localPayload);
+          return;
+        }
+        if (typeof target.localNotification === "function") {
+          await callMaybeAsync(target, "localNotification", localPayload);
+          return;
+        }
+        if (typeof target.notify === "function") {
+          await callMaybeAsync(target, "notify", flatPayload);
+          return;
+        }
+      } catch {}
     }
-
-    showToast(`${title}: ${body}`);
   }
+
 
   function recordChanges(changes) {
     if (!changes.length) return;
     storage.changes = [...changes, ...(storage.changes ?? [])].slice(0, MAX_CHANGES);
-    changes.forEach(notify);
+    changes.forEach((change) => void notify(change));
   }
 
   function writeSnapshot(friends, guilds) {
@@ -185,6 +236,18 @@
     return change.kind === kind && change.action === action;
   }
 
+  function sendTestNotification() {
+    void notify({
+      id: "test",
+      label: PLUGIN_NAME,
+      seenAt: Date.now(),
+      changeId: `test:${Date.now()}`,
+      kind: "friend",
+      action: "removed",
+      changedAt: Date.now(),
+    });
+  }
+
   function ChangeLogSettings() {
     ensureStorage();
     const [filter, setFilter] = React.useState("all");
@@ -206,6 +269,11 @@
       { style: { padding: 16 } },
       e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
       e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
+      e(
+        Pressable,
+        { onPress: sendTestNotification, style: { backgroundColor: "#5865f2", borderRadius: 12, padding: 12, marginBottom: 12 } },
+        e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Send test notification"),
+      ),
       e(
         View,
         { style: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 } },
