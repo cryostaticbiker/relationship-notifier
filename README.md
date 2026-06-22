@@ -1,104 +1,132 @@
 # Relationship Notifier
 
-Relationship Notifier is a Revenge/Vendetta-compatible Discord mobile plugin that keeps a local snapshot of your friend list and joined servers. It alerts you when a previously recorded friend disappears from your friends list or a previously recorded server disappears from your guild list.
+Relationship Notifier is a Revenge-compatible Discord mobile plugin that watches the relationships and guilds visible to the client. After its first baseline scan, it sends a mobile/local notification every time it detects one of these changes:
 
-## Required Revenge plugin layout
+- a mutual/friend is added;
+- a mutual/friend removes you or otherwise disappears from your friend list;
+- you are added to a server;
+- you are removed from a server.
 
-This repository is intentionally laid out as a directly installable Revenge plugin:
+The plugin also adds a settings page with a filterable change log. You can view all recorded changes or filter to mutual additions, mutual removals, server additions, or server removals.
 
-- `npm run build` creates the installable files in `dist/`.
-- `dist/manifest.json` is fetched first by Revenge.
-- `dist/manifest.json` has `"main": "index.js"`, so Revenge then fetches `dist/index.js` from the same folder URL.
-- `dist/index.js` is the runnable plugin expression. Do not wrap it in CommonJS `module.exports`; Revenge evaluates the file as an expression and expects the result to contain `onLoad`/`onUnload`.
-- `dist/manifest.json` includes a `hash` of `dist/index.js`; run `npm run build` after editing `index.js` so installed clients know to download the update.
+> Note: mobile clients expose local notification APIs differently. The plugin now tries Notifee-style, React Native local notification, and native module notification bridges first, then falls back to an in-app toast if the current Revenge/Discord build does not expose one. Because Revenge plugins run inside Discord, this is a local/mobile notification while Discord is running, not a remote APNs/FCM server push while the app is fully killed.
 
-## Fixing "failed to find manifest"
-
-That error means Revenge could not fetch JSON from `<the URL you pasted>/manifest.json`. The most common cause is pasting the normal GitHub repository page, such as:
+## Repository layout
 
 ```text
-https://github.com/YOUR_USERNAME/relationship-notifier
+manifest.json            # Root manifest for repository/GitHub Pages installs
+index.js                 # Runtime plugin expression consumed by Revenge
+src/index.ts             # Typed source mirror of the runtime logic
+status.json              # Plugin-list style status metadata
+dist/manifest.json       # Generated install manifest; main points to index.js
+dist/index.js            # Generated install script copied from index.js
+scripts/build.mjs        # Build script that refreshes dist/ and manifest hashes
+scripts/verify-install-url.mjs
 ```
 
-Do **not** paste the GitHub web page URL. It returns HTML, not `dist/manifest.json`. Use one of the install URLs below instead, and keep the trailing `/`.
+## Prerequisites
 
-Before pasting a URL into Revenge, you can test it from your computer:
+Install Node.js and npm. Then install the development dependencies from the repository root:
 
 ```sh
-node scripts/verify-install-url.mjs https://cdn.jsdelivr.net/gh/YOUR_USERNAME/relationship-notifier@main/dist/
+npm install
 ```
 
-If the check prints the folder, manifest, and script URLs, Revenge should be able to find the manifest.
+If your npm environment blocks registry access, install the dependencies using a network/registry configuration that can fetch the packages listed in `package.json` and `package-lock.json`.
 
-## Install in Revenge
+## Build and typecheck
 
-### GitHub Pages option
+Run these commands from the repository root:
 
-Use this method if you want the plugin to be importable directly from your GitHub account.
-
-1. Create a public GitHub repository named `relationship-notifier`.
-2. Run `npm run build` and commit the generated `dist/manifest.json` and `dist/index.js` files.
-3. Push this repository's files to that GitHub repository. The repository root must contain the `dist/` folder with both `dist/manifest.json` and `dist/index.js`.
-4. In GitHub, open the repository and go to **Settings → Pages**.
-5. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
-6. Set **Branch** to the branch that contains this plugin, usually `main`, and set the folder to `/ (root)`.
-7. Click **Save** and wait for GitHub Pages to finish deploying. GitHub will show the published site URL.
-8. In Revenge, go to **Plugins**, tap **+**, and paste this GitHub Pages import URL after replacing `YOUR_GITHUB_USERNAME` with your GitHub username:
-
-   ```text
-   https://YOUR_GITHUB_USERNAME.github.io/relationship-notifier/dist/
-   ```
-
-   For example, if your GitHub username is `octocat`, paste this exact URL into Revenge:
-
-   ```text
-   https://octocat.github.io/relationship-notifier/dist/
-   ```
-
-9. If Revenge still says `failed to find manifest`, open this URL in a browser after replacing `YOUR_GITHUB_USERNAME`; it must show the JSON contents of `dist/manifest.json`:
-
-   ```text
-   https://YOUR_GITHUB_USERNAME.github.io/relationship-notifier/dist/manifest.json
-   ```
-
-### jsDelivr option
-
-If the repository is public on GitHub, paste a jsDelivr folder URL in Revenge:
-
-```text
-https://cdn.jsdelivr.net/gh/YOUR_USERNAME/relationship-notifier@main/dist/
+```sh
+npm run typecheck
+npm run build
 ```
 
-Replace `YOUR_USERNAME` and `main` with your GitHub username and branch name. Keep the trailing `/`; Revenge fetches `manifest.json` relative to that folder URL.
+`npm run typecheck` runs TypeScript without emitting files. `npm run build` copies `index.js` to `dist/index.js`, writes `dist/manifest.json`, and updates the SHA-256 hash in both manifests.
 
-### Local testing option
-
-From the repository root, build the `dist/` files, then run a static server and install the LAN URL in Revenge:
+After every edit to `index.js` or `manifest.json`, run:
 
 ```sh
 npm run build
+```
+
+Commit the generated `dist/index.js` and `dist/manifest.json` files with the source changes so Revenge can install the latest version.
+
+## Verify the install folder locally
+
+After building, verify the local install layout:
+
+```sh
+npm run verify:local
+```
+
+A successful check prints the folder URL, manifest URL, and script URL. You can also serve the repo locally for phone testing:
+
+```sh
 python3 -m http.server 8080
 ```
 
-Then add this URL in Revenge, replacing `YOUR_COMPUTER_LAN_IP` with your computer's LAN IP address:
+Then install this URL in Revenge, replacing the IP address with your computer's LAN IP:
 
 ```text
 http://YOUR_COMPUTER_LAN_IP:8080/dist/
 ```
 
-Your phone and computer must be on the same network, and Android/Discord must be allowed to reach that local HTTP address.
+Your phone and computer must be on the same network.
 
-## What it does
+## Publish on GitHub Pages
 
-- Stores a local baseline of all visible friends and servers on first load.
-- Subscribes to Discord Flux events for relationship and guild removals.
-- Re-scans periodically so removals are still detected if an event name changes or fires during startup.
-- Attempts to send an Android/native notification first, then falls back to an in-app toast if the running client does not expose a compatible notification bridge.
-- Exposes `resyncBaseline()` from the plugin object for manual debugging/baseline refreshes without alerts.
+1. Create a public GitHub repository for this plugin.
+2. Push the repository with these files committed:
+   - `manifest.json`
+   - `index.js`
+   - `status.json`
+   - `dist/manifest.json`
+   - `dist/index.js`
+   - the supporting source/scripts/docs files
+3. On GitHub, open the repository and go to **Settings → Pages**.
+4. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
+5. Select the branch you pushed, usually `main`, and select `/ (root)` as the folder.
+6. Click **Save** and wait for GitHub Pages to deploy.
+7. GitHub will show a Pages URL like:
 
-## Notes
+   ```text
+   https://YOUR_GITHUB_USERNAME.github.io/relationship-notifier/
+   ```
 
-- The snapshot stays in Revenge plugin storage on the device.
-- The plugin only compares data that Discord exposes to the client.
-- Guild outage/unavailable events refresh the baseline silently to avoid false server-removal alerts.
-- Android notification APIs differ across Discord/Revenge builds, so the plugin tries several known native notification method names before falling back to `showToast`.
+8. In Revenge, open **Plugins**, tap **+**, and paste the plugin folder URL. For this repository layout, use the `dist/` folder and keep the trailing slash:
+
+   ```text
+   https://YOUR_GITHUB_USERNAME.github.io/relationship-notifier/dist/
+   ```
+
+9. If installation fails, open this URL in a browser and confirm it displays JSON:
+
+   ```text
+   https://YOUR_GITHUB_USERNAME.github.io/relationship-notifier/dist/manifest.json
+   ```
+
+## Alternative install URL with jsDelivr
+
+If the repository is public on GitHub, you can also install from jsDelivr after building and pushing `dist/`:
+
+```text
+https://cdn.jsdelivr.net/gh/YOUR_GITHUB_USERNAME/relationship-notifier@main/dist/
+```
+
+Replace `YOUR_GITHUB_USERNAME` and `main` with your GitHub username and branch name. Keep the trailing slash.
+
+## Using the settings page
+
+Open the plugin settings in Revenge to view the change log. Use **Send test notification** at the top of the settings page to confirm that your current Discord/Revenge build exposes a native notification bridge. The available filters are:
+
+- **All**: every recorded mutual and server change;
+- **Mutuals**: all mutual additions and removals;
+- **Mutual adds**: only users who appeared in your friend list;
+- **Mutual removals**: only users who disappeared from your friend list;
+- **Servers**: all server additions and removals;
+- **Server adds**: only servers that appeared in your guild list;
+- **Server removals**: only servers that disappeared from your guild list.
+
+The first plugin load creates a baseline and does not alert for existing mutuals or servers. Changes are recorded after that baseline exists. The log keeps the newest 250 entries on the device in Revenge plugin storage.

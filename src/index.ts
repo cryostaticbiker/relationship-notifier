@@ -1,287 +1,324 @@
 import { findByProps, findByStoreName } from "@vendetta/metro";
-import { FluxDispatcher, ReactNative } from "@vendetta/metro/common";
+import { FluxDispatcher, React, ReactNative } from "@vendetta/metro/common";
 import { storage } from "@vendetta/plugin";
 import { showToast } from "@vendetta/ui/toasts";
 
-type StoredEntity = {
-  id: string;
-  name: string;
-  recordedAt: number;
+type ChangeKind = "friend" | "guild";
+type ChangeAction = "added" | "removed";
+type SnapshotEntry = { id: string; label: string; seenAt: number };
+type Snapshot = Record<string, SnapshotEntry>;
+type ChangeRecord = SnapshotEntry & {
+  changeId: string;
+  kind: ChangeKind;
+  action: ChangeAction;
+  changedAt: number;
 };
-
-type Snapshot = Record<string, StoredEntity>;
-
-type PluginStorage = {
+type FilterValue = "all" | "friend" | "guild" | "friend-added" | "friend-removed" | "guild-added" | "guild-removed";
+type StorageShape = {
+  version?: number;
   friends?: Snapshot;
   guilds?: Snapshot;
-  initializedAt?: number;
+  ready?: boolean;
   lastScanAt?: number;
-  notifyOnUnfriends?: boolean;
-  notifyOnGuildRemoval?: boolean;
-  scanIntervalMs?: number;
+  changes?: ChangeRecord[];
 };
 
-type Change = {
-  kind: "friend" | "guild";
-  entity: StoredEntity;
-};
+const PLUGIN_NAME = "Relationship Notifier";
+const STORAGE_VERSION = 3;
+const FRIEND_TYPE = 1;
+const SCAN_EVERY_MS = 60_000;
+const DEBOUNCE_MS = 750;
+const MAX_CHANGES = 250;
+const CHANNEL_ID = "relationship-notifier";
+const store = storage as StorageShape;
 
-type NativeNotificationOptions = {
-  title: string;
-  body: string;
-  channelId?: string;
-  identifier?: string;
-  smallIcon?: string;
-  userInfo?: Record<string, unknown>;
-};
+const RelationshipStore = findByStoreName("RelationshipStore") ?? findByProps("getRelationships");
+const UserStore = findByStoreName("UserStore") ?? findByProps("getUser");
+const GuildStore = findByStoreName("GuildStore") ?? findByProps("getGuilds");
 
-const vstorage = storage as PluginStorage;
+let interval: ReturnType<typeof setInterval> | undefined;
+let debounce: ReturnType<typeof setTimeout> | undefined;
+const listeners: Array<[string, (event: unknown) => void]> = [];
 
-const DEFAULT_SCAN_INTERVAL_MS = 60_000;
-const FRIEND_RELATIONSHIP_TYPE = 1;
-const NOTIFICATION_CHANNEL_ID = "relationship-notifier";
-
-const RelationshipStore = findByStoreName("RelationshipStore");
-const UserStore = findByStoreName("UserStore");
-const GuildStore = findByStoreName("GuildStore");
-const AndroidNotificationModule = findByProps("displayNotification") ?? findByProps("showNotification");
-const LocalNotificationModule = findByProps("presentLocalNotification") ?? findByProps("localNotification");
-
-let scanTimer: ReturnType<typeof setInterval> | undefined;
-let suppressNextScan = false;
-
-function now() {
-  return Date.now();
+function ensureStorage() {
+  store.version = STORAGE_VERSION;
+  store.friends ??= {};
+  store.guilds ??= {};
+  store.ready ??= false;
+  store.lastScanAt ??= 0;
+  store.changes ??= [];
 }
 
-function getDisplayName(user: any, fallbackId: string) {
-  return user?.globalName ?? user?.username ?? user?.tag ?? fallbackId;
+function labelUser(user: any, id: string) {
+  return user?.globalName ?? user?.global_name ?? user?.displayName ?? user?.username ?? user?.tag ?? id;
 }
 
-function getGuildName(guild: any, fallbackId: string) {
-  return guild?.name ?? guild?.properties?.name ?? fallbackId;
+function labelGuild(guild: any, id: string) {
+  return guild?.name ?? guild?.properties?.name ?? id;
 }
 
-function getFriendIds() {
-  if (typeof RelationshipStore?.getFriendIDs === "function") {
-    return RelationshipStore.getFriendIDs() as string[];
-  }
+function friendIds() {
+  if (typeof RelationshipStore?.getFriendIDs === "function") return RelationshipStore.getFriendIDs() as string[];
+  if (typeof RelationshipStore?.getFriendIds === "function") return RelationshipStore.getFriendIds() as string[];
 
-  const relationships =
-    typeof RelationshipStore?.getRelationships === "function" ? RelationshipStore.getRelationships() : {};
+  const relationships = typeof RelationshipStore?.getRelationships === "function" ? RelationshipStore.getRelationships() : {};
 
   return Object.entries(relationships)
-    .filter(([, relationshipType]) => relationshipType === FRIEND_RELATIONSHIP_TYPE)
+    .filter(([, relationship]) => relationship === FRIEND_TYPE)
     .map(([id]) => id);
 }
 
-function readCurrentFriends(): Snapshot {
-  return Object.fromEntries(
-    getFriendIds().map((id) => [
-      id,
-      {
-        id,
-        name: getDisplayName(UserStore?.getUser?.(id), id),
-        recordedAt: now(),
-      },
-    ]),
-  );
+function currentFriends(): Snapshot {
+  const seenAt = Date.now();
+  return Object.fromEntries(friendIds().map((id) => [id, { id, label: labelUser(UserStore?.getUser?.(id), id), seenAt }]));
 }
 
-function readCurrentGuilds(): Snapshot {
+function currentGuilds(): Snapshot {
+  const seenAt = Date.now();
   const guilds = typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
 
-  return Object.fromEntries(
-    Object.entries(guilds).map(([id, guild]) => [
-      id,
-      {
-        id,
-        name: getGuildName(guild, id),
-        recordedAt: now(),
-      },
-    ]),
-  );
+  return Object.fromEntries(Object.entries(guilds).map(([id, guild]) => [id, { id, label: labelGuild(guild, id), seenAt }]));
 }
 
-function findRemoved(previous: Snapshot | undefined, current: Snapshot): StoredEntity[] {
-  if (!previous) return [];
+function compare(kind: ChangeKind, previous: Snapshot | undefined, next: Snapshot): ChangeRecord[] {
+  const changedAt = Date.now();
+  const changes: ChangeRecord[] = [];
 
-  return Object.values(previous).filter((entity) => !current[entity.id]);
+  for (const entry of Object.values(next)) {
+    if (!previous?.[entry.id]) changes.push({ ...entry, kind, action: "added", changedAt, changeId: `${kind}:added:${entry.id}:${changedAt}` });
+  }
+
+  for (const entry of Object.values(previous ?? {})) {
+    if (!next[entry.id]) changes.push({ ...entry, kind, action: "removed", changedAt, changeId: `${kind}:removed:${entry.id}:${changedAt}` });
+  }
+
+  return changes;
 }
 
-function persistSnapshot(friends: Snapshot, guilds: Snapshot) {
-  vstorage.friends = friends;
-  vstorage.guilds = guilds;
-  vstorage.lastScanAt = now();
-}
-
-function notificationBody(change: Change) {
+function notificationText(change: ChangeRecord) {
   if (change.kind === "friend") {
-    return `${change.entity.name} is no longer in your friends list.`;
+    return {
+      title: change.action === "added" ? "Mutual added" : "Mutual removed",
+      body: change.action === "added" ? `${change.label} is now in your friends list.` : `${change.label} removed you from their friends list.`,
+    };
   }
 
-  return `You are no longer in ${change.entity.name}.`;
-}
-
-function dispatchDiscordLocalNotification(options: NativeNotificationOptions) {
-  const payload = {
-    title: options.title,
-    body: options.body,
-    message: options.body,
-    channelId: options.channelId,
-    identifier: options.identifier,
-    smallIcon: options.smallIcon,
-    userInfo: options.userInfo,
+  return {
+    title: change.action === "added" ? "Server added" : "Server removed",
+    body: change.action === "added" ? `You were added to ${change.label}.` : `You were removed from ${change.label}.`,
   };
-
-  const candidates = [AndroidNotificationModule, LocalNotificationModule, ReactNative?.NativeModules?.Notifications];
-  const methodNames = [
-    "displayNotification",
-    "showNotification",
-    "presentLocalNotification",
-    "localNotification",
-    "scheduleLocalNotification",
-    "notify",
-  ];
-
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-
-    for (const methodName of methodNames) {
-      const method = candidate[methodName];
-      if (typeof method === "function") {
-        method.call(candidate, payload);
-        return true;
-      }
-    }
-  }
-
-  return false;
 }
 
-function notify(change: Change) {
-  const title = change.kind === "friend" ? "Friend removed" : "Server removed";
-  const body = notificationBody(change);
-  const delivered = dispatchDiscordLocalNotification({
+async function callMaybeAsync(target: any, method: string, payload?: unknown) {
+  return await Promise.resolve(target[method](payload));
+}
+
+function notificationTargets() {
+  const nativeModules = ReactNative?.NativeModules ?? {};
+  const directCandidates = [
+    findByProps("displayNotification"),
+    findByProps("showNotification"),
+    findByProps("presentLocalNotification"),
+    findByProps("localNotification"),
+    findByProps("requestPermission", "displayNotification"),
+    findByProps("createChannel", "displayNotification"),
+    nativeModules.Notifications,
+    nativeModules.NotificationManager,
+    nativeModules.PushNotificationManager,
+    nativeModules.PushNotificationIOS,
+  ];
+  const dynamicCandidates = Object.values(nativeModules).filter((module: any) =>
+    ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"].some(
+      (method) => typeof module?.[method] === "function",
+    ),
+  );
+
+  return [...directCandidates, ...dynamicCandidates].filter(Boolean);
+}
+
+async function notify(change: ChangeRecord) {
+  const { title, body } = notificationText(change);
+  const flatPayload = { title, body, message: body, channelId: CHANNEL_ID, identifier: change.changeId, smallIcon: "ic_notification" };
+  const notifeePayload = {
     title,
     body,
-    channelId: NOTIFICATION_CHANNEL_ID,
-    identifier: `relationship-notifier-${change.kind}-${change.entity.id}-${now()}`,
-    smallIcon: "ic_notification",
-    userInfo: {
-      plugin: "relationship-notifier",
-      kind: change.kind,
-      id: change.entity.id,
-    },
-  });
+    data: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+    android: { channelId: CHANNEL_ID, smallIcon: "ic_notification", pressAction: { id: "default" } },
+    ios: { sound: "default" },
+  };
+  const localPayload = {
+    ...flatPayload,
+    alertTitle: title,
+    alertBody: body,
+    alertAction: "view",
+    soundName: "default",
+    userInfo: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
+  };
 
-  if (!delivered) {
-    showToast(`${title}: ${body}`);
+  for (const target of notificationTargets()) {
+    try {
+      if (typeof target.requestPermission === "function") await callMaybeAsync(target, "requestPermission");
+      if (typeof target.requestPermissions === "function") await callMaybeAsync(target, "requestPermissions");
+      if (typeof target.createChannel === "function") {
+        await callMaybeAsync(target, "createChannel", { id: CHANNEL_ID, name: PLUGIN_NAME, importance: 4 });
+      }
+
+      if (typeof target.displayNotification === "function") {
+        await callMaybeAsync(target, "displayNotification", notifeePayload);
+        return;
+      }
+      if (typeof target.showNotification === "function") {
+        await callMaybeAsync(target, "showNotification", flatPayload);
+        return;
+      }
+      if (typeof target.presentLocalNotification === "function") {
+        await callMaybeAsync(target, "presentLocalNotification", localPayload);
+        return;
+      }
+      if (typeof target.localNotification === "function") {
+        await callMaybeAsync(target, "localNotification", localPayload);
+        return;
+      }
+      if (typeof target.notify === "function") {
+        await callMaybeAsync(target, "notify", flatPayload);
+        return;
+      }
+    } catch {}
   }
+
+  showToast(`${title}: ${body}`);
 }
 
-function scan() {
-  const currentFriends = readCurrentFriends();
-  const currentGuilds = readCurrentGuilds();
-
-  if (!vstorage.initializedAt) {
-    vstorage.initializedAt = now();
-    persistSnapshot(currentFriends, currentGuilds);
-    return;
-  }
-
-  if (!suppressNextScan) {
-    if (vstorage.notifyOnUnfriends) {
-      findRemoved(vstorage.friends, currentFriends).forEach((entity) => notify({ kind: "friend", entity }));
-    }
-
-    if (vstorage.notifyOnGuildRemoval) {
-      findRemoved(vstorage.guilds, currentGuilds).forEach((entity) => notify({ kind: "guild", entity }));
-    }
-  }
-
-  suppressNextScan = false;
-  persistSnapshot(currentFriends, currentGuilds);
+function recordChanges(changes: ChangeRecord[]) {
+  if (!changes.length) return;
+  store.changes = [...changes, ...(store.changes ?? [])].slice(0, MAX_CHANGES);
+  changes.forEach((change) => void notify(change));
 }
 
-function scanSoon() {
-  setTimeout(scan, 750);
+function writeSnapshot(friends: Snapshot, guilds: Snapshot) {
+  store.friends = friends;
+  store.guilds = guilds;
+  store.ready = true;
+  store.lastScanAt = Date.now();
 }
 
-function handleRelationshipRemove(event: any) {
-  const id = event?.relationship?.id ?? event?.user?.id ?? event?.userId ?? event?.id;
-  const knownFriend = id ? vstorage.friends?.[id] : undefined;
+function scan({ silent = false } = {}) {
+  ensureStorage();
+  const friends = currentFriends();
+  const guilds = currentGuilds();
 
-  if (vstorage.notifyOnUnfriends && knownFriend) {
-    notify({ kind: "friend", entity: knownFriend });
-    delete vstorage.friends?.[knownFriend.id];
+  if (store.ready && !silent) {
+    recordChanges([...compare("friend", store.friends, friends), ...compare("guild", store.guilds, guilds)]);
   }
 
-  scanSoon();
+  writeSnapshot(friends, guilds);
 }
 
-function handleGuildDelete(event: any) {
-  const id = event?.guild?.id ?? event?.guildId ?? event?.id;
-  const knownGuild = id ? vstorage.guilds?.[id] : undefined;
-
-  if (vstorage.notifyOnGuildRemoval && knownGuild) {
-    notify({ kind: "guild", entity: knownGuild });
-    delete vstorage.guilds?.[knownGuild.id];
-  }
-
-  scanSoon();
+function scheduleScan() {
+  if (debounce) clearTimeout(debounce);
+  debounce = setTimeout(() => scan({ silent: false }), DEBOUNCE_MS);
 }
 
-const subscriptions: Array<[string, (event: any) => void]> = [
-  ["RELATIONSHIP_REMOVE", handleRelationshipRemove],
-  ["GUILD_DELETE", handleGuildDelete],
-  ["GUILD_UNAVAILABLE", scanSoon],
-  ["CONNECTION_OPEN", scanSoon],
-];
-
-function subscribeAll() {
-  for (const [event, handler] of subscriptions) {
-    FluxDispatcher?.subscribe?.(event, handler);
-  }
+function subscribe(event: string, handler: (event: unknown) => void) {
+  FluxDispatcher?.subscribe?.(event, handler);
+  listeners.push([event, handler]);
 }
 
 function unsubscribeAll() {
-  for (const [event, handler] of subscriptions) {
-    FluxDispatcher?.unsubscribe?.(event, handler);
-  }
+  for (const [event, handler] of listeners.splice(0)) FluxDispatcher?.unsubscribe?.(event, handler);
 }
 
-function applyDefaults() {
-  vstorage.notifyOnUnfriends ??= true;
-  vstorage.notifyOnGuildRemoval ??= true;
-  vstorage.scanIntervalMs ??= DEFAULT_SCAN_INTERVAL_MS;
+function matchesFilter(change: ChangeRecord, filter: FilterValue) {
+  if (filter === "all") return true;
+  if (filter === "friend" || filter === "guild") return change.kind === filter;
+  const [kind, action] = filter.split("-");
+  return change.kind === kind && change.action === action;
 }
 
-export function onLoad() {
-  applyDefaults();
-  subscribeAll();
-  scan();
-  scanTimer = setInterval(scan, vstorage.scanIntervalMs);
+function sendTestNotification() {
+  void notify({
+    id: "test",
+    label: PLUGIN_NAME,
+    seenAt: Date.now(),
+    changeId: `test:${Date.now()}`,
+    kind: "friend",
+    action: "removed",
+    changedAt: Date.now(),
+  });
 }
 
-export function onUnload() {
-  unsubscribeAll();
+function ChangeLogSettings() {
+  ensureStorage();
+  const [filter, setFilter] = React.useState("all" as FilterValue);
+  const changes = (store.changes ?? []).filter((change) => matchesFilter(change, filter));
+  const filters: Array<[FilterValue, string]> = [
+    ["all", "All"],
+    ["friend", "Mutuals"],
+    ["friend-added", "Mutual adds"],
+    ["friend-removed", "Mutual removals"],
+    ["guild", "Servers"],
+    ["guild-added", "Server adds"],
+    ["guild-removed", "Server removals"],
+  ];
 
-  if (scanTimer) {
-    clearInterval(scanTimer);
-    scanTimer = undefined;
-  }
+  const e = React.createElement;
+  const { ScrollView, View, Text, Pressable } = ReactNative;
+
+  return e(
+    ScrollView,
+    { style: { padding: 16 } },
+    e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
+    e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
+    e(
+      Pressable,
+      { onPress: sendTestNotification, style: { backgroundColor: "#5865f2", borderRadius: 12, padding: 12, marginBottom: 12 } },
+      e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Send test notification"),
+    ),
+    e(
+      View,
+      { style: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 } },
+      ...filters.map(([value, label]) =>
+        e(
+          Pressable,
+          { key: value, onPress: () => setFilter(value), style: { backgroundColor: filter === value ? "#5865f2" : "#2f3136", borderRadius: 16, paddingHorizontal: 12, paddingVertical: 8 } },
+          e(Text, { style: { color: "white", fontWeight: "600" } }, label),
+        ),
+      ),
+    ),
+    changes.length
+      ? changes.map((change) => {
+          const { title, body } = notificationText(change);
+          return e(
+            View,
+            { key: change.changeId, style: { backgroundColor: "#2f3136", borderRadius: 12, marginBottom: 10, padding: 12 } },
+            e(Text, { style: { color: "white", fontWeight: "700", marginBottom: 4 } }, title),
+            e(Text, { style: { color: "#dcddde", marginBottom: 6 } }, body),
+            e(Text, { style: { color: "#8e9297", fontSize: 12 } }, new Date(change.changedAt).toLocaleString()),
+          );
+        })
+      : e(Text, { style: { color: "#b9bbbe" } }, "No changes recorded for this filter yet."),
+  );
 }
 
-export const commands = [
-  {
-    name: "relationship-notifier-resync",
-    displayName: "relationship-notifier-resync",
-    description: "Refresh the Relationship Notifier baseline without sending alerts.",
-    execute: () => {
-      suppressNextScan = true;
-      scan();
-      showToast("Relationship Notifier baseline refreshed.");
-    },
+export default {
+  onLoad() {
+    ensureStorage();
+    subscribe("RELATIONSHIP_ADD", scheduleScan);
+    subscribe("RELATIONSHIP_REMOVE", scheduleScan);
+    subscribe("GUILD_CREATE", scheduleScan);
+    subscribe("GUILD_DELETE", scheduleScan);
+    subscribe("CONNECTION_OPEN", scheduleScan);
+    scan({ silent: false });
+    interval = setInterval(scan, SCAN_EVERY_MS);
   },
-];
+  onUnload() {
+    unsubscribeAll();
+    if (interval) clearInterval(interval);
+    if (debounce) clearTimeout(debounce);
+  },
+  settings: ChangeLogSettings,
+  resyncBaseline() {
+    scan({ silent: true });
+    showToast(`${PLUGIN_NAME}: baseline refreshed.`);
+  },
+};

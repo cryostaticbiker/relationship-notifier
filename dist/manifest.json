@@ -1,9 +1,9 @@
 {
   "name": "Relationship Notifier",
-  "description": "Stores your friends and servers, then sends an Android notification if someone unfriends you or you are removed from a server.",
+  "description": "Sends mobile notifications and keeps a filterable log when mutuals or servers are added or removed.",
   "authors": [
     {
-      "name": "OpenAI",
+      "name": "cryostaticbiker",
       "id": "0"
     }
   ],
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_notification"
   },
-  "hash": "3e28e783ca3847e4eff1410f699d09cf8f8723efe00f87935c6231d1ea745990"
+  "hash": "1b8a5ef1664e9be042438b3c6e9622a959ad2033a5c76eb8cc36b0777b5e8f56"
 }
