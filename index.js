@@ -1,60 +1,43 @@
 (() => {
   const PLUGIN_NAME = "Relationship Notifier";
-  const STORAGE_VERSION = 1;
-  const FRIEND_RELATIONSHIP_TYPE = 1;
-  const SCAN_INTERVAL_MS = 60_000;
-  const RESCAN_DELAY_MS = 1_000;
-  const NOTIFICATION_CHANNEL_ID = "relationship-notifier";
+  const STORAGE_VERSION = 2;
+  const FRIEND_TYPE = 1;
+  const SCAN_EVERY_MS = 60_000;
+  const DEBOUNCE_MS = 1_000;
+  const CHANNEL_ID = "relationship-notifier";
 
-  const storage = vendetta.plugin.storage;
-  const metro = vendetta.metro;
-  const common = metro.common ?? {};
-  const FluxDispatcher = common.FluxDispatcher;
-  const ReactNative = common.ReactNative;
-  const showToast = vendetta.ui?.toasts?.showToast ?? (() => undefined);
-  const logger = vendetta.logger ?? console;
+  const { metro, plugin, ui, logger = console } = vendetta;
+  const storage = plugin.storage;
+  const FluxDispatcher = metro.common?.FluxDispatcher;
+  const ReactNative = metro.common?.ReactNative;
+  const showToast = ui?.toasts?.showToast ?? (() => undefined);
 
-  let scanTimer;
-  let rescanTimer;
+  let interval;
+  let debounce;
+  const listeners = [];
 
-  const subscriptions = [];
-
-  function timestamp() {
-    return Date.now();
-  }
-
-  function getStore(name, fallbackProps) {
-    if (typeof metro.findByStoreName === "function") {
-      const store = metro.findByStoreName(name);
-      if (store) return store;
-    }
-
-    return metro.findByProps?.(...fallbackProps);
-  }
-
-  const RelationshipStore = getStore("RelationshipStore", ["getRelationships"]);
-  const UserStore = getStore("UserStore", ["getUser", "getCurrentUser"]);
-  const GuildStore = getStore("GuildStore", ["getGuilds", "getGuild"]);
+  const byStore = (name, ...props) => metro.findByStoreName?.(name) ?? metro.findByProps?.(...props);
+  const RelationshipStore = byStore("RelationshipStore", "getRelationships");
+  const UserStore = byStore("UserStore", "getUser");
+  const GuildStore = byStore("GuildStore", "getGuilds");
 
   function ensureStorage() {
-    storage.version ??= STORAGE_VERSION;
+    storage.version = STORAGE_VERSION;
     storage.friends ??= {};
     storage.guilds ??= {};
-    storage.initializedAt ??= 0;
+    storage.ready ??= false;
     storage.lastScanAt ??= 0;
-    storage.notifyOnUnfriends ??= true;
-    storage.notifyOnGuildRemoval ??= true;
   }
 
-  function displayNameForUser(user, fallbackId) {
-    return user?.globalName ?? user?.global_name ?? user?.displayName ?? user?.username ?? user?.tag ?? fallbackId;
+  function labelUser(user, id) {
+    return user?.globalName ?? user?.global_name ?? user?.displayName ?? user?.username ?? user?.tag ?? id;
   }
 
-  function displayNameForGuild(guild, fallbackId) {
-    return guild?.name ?? guild?.properties?.name ?? fallbackId;
+  function labelGuild(guild, id) {
+    return guild?.name ?? guild?.properties?.name ?? id;
   }
 
-  function getFriendIds() {
+  function friendIds() {
     if (typeof RelationshipStore?.getFriendIDs === "function") return RelationshipStore.getFriendIDs();
     if (typeof RelationshipStore?.getFriendIds === "function") return RelationshipStore.getFriendIds();
 
@@ -62,150 +45,99 @@
       typeof RelationshipStore?.getRelationships === "function" ? RelationshipStore.getRelationships() : {};
 
     return Object.entries(relationships)
-      .filter(([, type]) => type === FRIEND_RELATIONSHIP_TYPE)
+      .filter(([, relationship]) => relationship === FRIEND_TYPE)
       .map(([id]) => id);
   }
 
-  function getGuilds() {
-    return typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
-  }
-
-  function snapshotFriends() {
+  function currentFriends() {
+    const seenAt = Date.now();
     return Object.fromEntries(
-      getFriendIds().map((id) => [
-        id,
-        {
-          id,
-          name: displayNameForUser(UserStore?.getUser?.(id), id),
-          recordedAt: timestamp(),
-        },
-      ]),
+      friendIds().map((id) => [id, { id, label: labelUser(UserStore?.getUser?.(id), id), seenAt }]),
     );
   }
 
-  function snapshotGuilds() {
+  function currentGuilds() {
+    const seenAt = Date.now();
+    const guilds = typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
+
     return Object.fromEntries(
-      Object.entries(getGuilds()).map(([id, guild]) => [
-        id,
-        {
-          id,
-          name: displayNameForGuild(guild, id),
-          recordedAt: timestamp(),
-        },
-      ]),
+      Object.entries(guilds).map(([id, guild]) => [id, { id, label: labelGuild(guild, id), seenAt }]),
     );
   }
 
-  function findRemoved(previous, current) {
-    return Object.values(previous ?? {}).filter((entity) => !current[entity.id]);
+  function removals(kind, previous, next) {
+    return Object.values(previous ?? {})
+      .filter((entry) => !next[entry.id])
+      .map((entry) => ({ kind, entry }));
   }
 
-  function saveSnapshot(friends, guilds) {
-    storage.friends = friends;
-    storage.guilds = guilds;
-    storage.lastScanAt = timestamp();
-  }
-
-  function findNotificationModule() {
-    const candidates = [
+  function notificationModule() {
+    const modules = [
       metro.findByProps?.("displayNotification"),
       metro.findByProps?.("showNotification"),
       metro.findByProps?.("presentLocalNotification"),
-      metro.findByProps?.("localNotification"),
       ReactNative?.NativeModules?.Notifications,
-      ReactNative?.NativeModules?.NotificationManager,
     ];
+    const methods = ["displayNotification", "showNotification", "presentLocalNotification", "localNotification", "notify"];
 
-    const methods = [
-      "displayNotification",
-      "showNotification",
-      "presentLocalNotification",
-      "localNotification",
-      "scheduleLocalNotification",
-      "notify",
-    ];
-
-    for (const module of candidates) {
-      if (!module) continue;
-
+    for (const module of modules) {
       for (const method of methods) {
-        if (typeof module[method] === "function") return { module, method };
+        if (typeof module?.[method] === "function") return { module, method };
       }
     }
   }
 
-  function notificationText(kind, entity) {
-    if (kind === "friend") {
-      return {
-        title: "Friend removed",
-        body: `${entity.name} is no longer in your friends list.`,
-      };
-    }
-
-    return {
-      title: "Server removed",
-      body: `You are no longer in ${entity.name}.`,
-    };
-  }
-
-  function notify(kind, entity) {
-    const { title, body } = notificationText(kind, entity);
-    const payload = {
-      title,
-      body,
-      message: body,
-      channelId: NOTIFICATION_CHANNEL_ID,
-      identifier: `${NOTIFICATION_CHANNEL_ID}-${kind}-${entity.id}-${timestamp()}`,
-      smallIcon: "ic_notification",
-      userInfo: {
-        plugin: NOTIFICATION_CHANNEL_ID,
-        kind,
-        id: entity.id,
-      },
-    };
+  function notify(removal) {
+    const isFriend = removal.kind === "friend";
+    const title = isFriend ? "Friend removed" : "Server removed";
+    const body = isFriend
+      ? `${removal.entry.label} is no longer in your friends list.`
+      : `You are no longer in ${removal.entry.label}.`;
 
     try {
-      const notificationModule = findNotificationModule();
-      if (notificationModule) {
-        notificationModule.module[notificationModule.method].call(notificationModule.module, payload);
+      const target = notificationModule();
+      if (target) {
+        target.module[target.method].call(target.module, {
+          title,
+          body,
+          message: body,
+          channelId: CHANNEL_ID,
+          identifier: `${CHANNEL_ID}-${removal.kind}-${removal.entry.id}-${Date.now()}`,
+          smallIcon: "ic_notification",
+        });
         return;
       }
     } catch (error) {
-      logger.warn?.(`[${PLUGIN_NAME}] Native notification failed`, error);
+      logger.warn?.(`[${PLUGIN_NAME}] Failed to show native notification`, error);
     }
 
     showToast(`${title}: ${body}`);
   }
 
-  function scan({ silent = false } = {}) {
-    ensureStorage();
-
-    const friends = snapshotFriends();
-    const guilds = snapshotGuilds();
-
-    if (!storage.initializedAt) {
-      storage.initializedAt = timestamp();
-      saveSnapshot(friends, guilds);
-      logger.log?.(`[${PLUGIN_NAME}] Stored initial relationship baseline.`);
-      return;
-    }
-
-    if (!silent) {
-      if (storage.notifyOnUnfriends) {
-        for (const friend of findRemoved(storage.friends, friends)) notify("friend", friend);
-      }
-
-      if (storage.notifyOnGuildRemoval) {
-        for (const guild of findRemoved(storage.guilds, guilds)) notify("guild", guild);
-      }
-    }
-
-    saveSnapshot(friends, guilds);
+  function writeSnapshot(friends, guilds) {
+    storage.friends = friends;
+    storage.guilds = guilds;
+    storage.ready = true;
+    storage.lastScanAt = Date.now();
   }
 
-  function scheduleScan(options) {
-    clearTimeout(rescanTimer);
-    rescanTimer = setTimeout(() => scan(options), RESCAN_DELAY_MS);
+  function scan({ silent = false } = {}) {
+    ensureStorage();
+    const friends = currentFriends();
+    const guilds = currentGuilds();
+
+    if (storage.ready && !silent) {
+      for (const removal of [...removals("friend", storage.friends, friends), ...removals("guild", storage.guilds, guilds)]) {
+        notify(removal);
+      }
+    }
+
+    writeSnapshot(friends, guilds);
+  }
+
+  function scheduleSilentScan() {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => scan({ silent: true }), DEBOUNCE_MS);
   }
 
   function eventId(event) {
@@ -213,48 +145,29 @@
   }
 
   function handleRelationshipRemove(event) {
-    const id = eventId(event);
-    const friend = id ? storage.friends?.[id] : undefined;
-
-    if (storage.notifyOnUnfriends && friend) {
-      notify("friend", friend);
-      delete storage.friends[id];
-    }
-
-    scheduleScan({ silent: true });
+    const entry = storage.friends?.[eventId(event)];
+    if (entry) notify({ kind: "friend", entry });
+    scheduleSilentScan();
   }
 
   function handleGuildDelete(event) {
     if (event?.guild?.unavailable || event?.unavailable) {
-      scheduleScan({ silent: true });
+      scheduleSilentScan();
       return;
     }
 
-    const id = eventId(event);
-    const guild = id ? storage.guilds?.[id] : undefined;
-
-    if (storage.notifyOnGuildRemoval && guild) {
-      notify("guild", guild);
-      delete storage.guilds[id];
-    }
-
-    scheduleScan({ silent: true });
+    const entry = storage.guilds?.[eventId(event)];
+    if (entry) notify({ kind: "guild", entry });
+    scheduleSilentScan();
   }
 
   function subscribe(event, handler) {
     FluxDispatcher?.subscribe?.(event, handler);
-    subscriptions.push([event, handler]);
+    listeners.push([event, handler]);
   }
 
   function unsubscribeAll() {
-    for (const [event, handler] of subscriptions.splice(0)) {
-      FluxDispatcher?.unsubscribe?.(event, handler);
-    }
-  }
-
-  function resyncBaseline() {
-    scan({ silent: true });
-    showToast(`${PLUGIN_NAME}: baseline refreshed.`);
+    for (const [event, handler] of listeners.splice(0)) FluxDispatcher?.unsubscribe?.(event, handler);
   }
 
   return {
@@ -262,19 +175,22 @@
       ensureStorage();
       subscribe("RELATIONSHIP_REMOVE", handleRelationshipRemove);
       subscribe("GUILD_DELETE", handleGuildDelete);
-      subscribe("CONNECTION_OPEN", () => scheduleScan({ silent: true }));
+      subscribe("CONNECTION_OPEN", scheduleSilentScan);
       scan({ silent: false });
-      scanTimer = setInterval(scan, SCAN_INTERVAL_MS);
+      interval = setInterval(scan, SCAN_EVERY_MS);
     },
 
     onUnload() {
       unsubscribeAll();
-      clearInterval(scanTimer);
-      clearTimeout(rescanTimer);
-      scanTimer = undefined;
-      rescanTimer = undefined;
+      clearInterval(interval);
+      clearTimeout(debounce);
+      interval = undefined;
+      debounce = undefined;
     },
 
-    resyncBaseline,
+    resyncBaseline() {
+      scan({ silent: true });
+      showToast(`${PLUGIN_NAME}: baseline refreshed.`);
+    },
   };
 })();
