@@ -35,6 +35,10 @@ const store = storage as StorageShape;
 const RelationshipStore = findByStoreName("RelationshipStore") ?? findByProps("getRelationships");
 const UserStore = findByStoreName("UserStore") ?? findByProps("getUser");
 const GuildStore = findByStoreName("GuildStore") ?? findByProps("getGuilds");
+const MessageActions = findByProps("sendMessage");
+const PrivateChannelActions =
+  findByProps("ensurePrivateChannel") ?? findByProps("createPrivateChannel") ?? findByProps("openPrivateChannel") ?? findByProps("getPrivateChannelIds");
+const ProfileActions = findByProps("showUserProfile") ?? findByProps("openUserProfile") ?? findByProps("showProfile") ?? findByProps("openProfile");
 
 let interval: ReturnType<typeof setInterval> | undefined;
 let debounce: ReturnType<typeof setTimeout> | undefined;
@@ -142,6 +146,87 @@ function notificationTargets() {
   return [...directCandidates, ...dynamicCandidates].filter(Boolean);
 }
 
+function openMutualProfile(userId: string) {
+  const payload = { userId };
+
+  for (const method of ["showUserProfile", "openUserProfile", "showProfile", "openProfile"]) {
+    if (typeof ProfileActions?.[method] === "function") {
+      try {
+        ProfileActions[method](payload);
+        return true;
+      } catch {
+        try {
+          ProfileActions[method](userId);
+          return true;
+        } catch {}
+      }
+    }
+  }
+
+  FluxDispatcher?.dispatch?.({ type: "USER_PROFILE_MODAL_OPEN", userId });
+  return true;
+}
+
+async function createSelfDmChannel() {
+  const currentUserId = UserStore?.getCurrentUser?.()?.id;
+  if (!currentUserId) return null;
+
+  for (const method of ["ensurePrivateChannel", "createPrivateChannel", "openPrivateChannel", "getDMFromUserId"]) {
+    if (typeof PrivateChannelActions?.[method] !== "function") continue;
+
+    try {
+      const result = await Promise.resolve(PrivateChannelActions[method](currentUserId));
+      if (typeof result === "string") return result;
+      if (typeof result?.id === "string") return result.id;
+      if (typeof result?.channel?.id === "string") return result.channel.id;
+    } catch {}
+  }
+
+  return null;
+}
+
+async function sendDmNotification(change: ChangeRecord) {
+  if (typeof MessageActions?.sendMessage !== "function") return false;
+
+  const channelId = await createSelfDmChannel();
+  if (!channelId) return false;
+
+  const { title, body } = notificationText(change);
+  try {
+    await Promise.resolve(MessageActions.sendMessage(channelId, { content: `**${PLUGIN_NAME}**\n${title}: ${body}`, tts: false }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function requestDmNotification(change: ChangeRecord) {
+  const sent = await sendDmNotification(change);
+  showToast(sent ? `${PLUGIN_NAME}: DM sent.` : `${PLUGIN_NAME}: DM unavailable.`);
+}
+
+function showAcknowledgement(change: ChangeRecord) {
+  const Alert = ReactNative?.Alert;
+  if (typeof Alert?.alert !== "function") return false;
+
+  const { title, body } = notificationText(change);
+  const buttons = [
+    ...(change.kind === "friend" ? [{ text: "Open profile", onPress: () => openMutualProfile(change.id) }] : []),
+    { text: "DM me", onPress: () => void requestDmNotification(change) },
+    { text: "Acknowledge", style: "cancel" },
+  ];
+
+  Alert.alert(title, body, buttons, { cancelable: true });
+  return true;
+}
+
+function notifyInApp(change: ChangeRecord) {
+  const { title, body } = notificationText(change);
+  showToast(`${title}: ${body}`);
+  showAcknowledgement(change);
+  void sendDmNotification(change);
+}
+
 async function notify(change: ChangeRecord, { tryAll = false } = {}) {
   const { title, body } = notificationText(change);
   const flatPayload = { title, body, message: body, channelId: CHANNEL_ID, identifier: change.changeId, smallIcon: "ic_notification" };
@@ -205,7 +290,7 @@ async function notify(change: ChangeRecord, { tryAll = false } = {}) {
 function recordChanges(changes: ChangeRecord[]) {
   if (!changes.length) return;
   store.changes = [...changes, ...(store.changes ?? [])].slice(0, MAX_CHANGES);
-  changes.forEach((change) => void notify(change));
+  changes.forEach(notifyInApp);
 }
 
 function writeSnapshot(friends: Snapshot, guilds: Snapshot) {

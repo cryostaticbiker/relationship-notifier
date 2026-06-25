@@ -22,6 +22,17 @@
   const RelationshipStore = byStore("RelationshipStore", "getRelationships");
   const UserStore = byStore("UserStore", "getUser");
   const GuildStore = byStore("GuildStore", "getGuilds");
+  const MessageActions = metro.findByProps?.("sendMessage");
+  const PrivateChannelActions =
+    metro.findByProps?.("ensurePrivateChannel") ??
+    metro.findByProps?.("createPrivateChannel") ??
+    metro.findByProps?.("openPrivateChannel") ??
+    metro.findByProps?.("getPrivateChannelIds");
+  const ProfileActions =
+    metro.findByProps?.("showUserProfile") ??
+    metro.findByProps?.("openUserProfile") ??
+    metro.findByProps?.("showProfile") ??
+    metro.findByProps?.("openProfile");
 
   function ensureStorage() {
     if (storage.version !== STORAGE_VERSION) {
@@ -137,6 +148,87 @@
     return [...directCandidates, ...dynamicCandidates].filter(Boolean);
   }
 
+  function openMutualProfile(userId) {
+    const payload = { userId };
+
+    for (const method of ["showUserProfile", "openUserProfile", "showProfile", "openProfile"]) {
+      if (typeof ProfileActions?.[method] === "function") {
+        try {
+          ProfileActions[method](payload);
+          return true;
+        } catch {
+          try {
+            ProfileActions[method](userId);
+            return true;
+          } catch {}
+        }
+      }
+    }
+
+    FluxDispatcher?.dispatch?.({ type: "USER_PROFILE_MODAL_OPEN", userId });
+    return true;
+  }
+
+  async function createSelfDmChannel() {
+    const currentUserId = UserStore?.getCurrentUser?.()?.id;
+    if (!currentUserId) return null;
+
+    for (const method of ["ensurePrivateChannel", "createPrivateChannel", "openPrivateChannel", "getDMFromUserId"]) {
+      if (typeof PrivateChannelActions?.[method] !== "function") continue;
+
+      try {
+        const result = await Promise.resolve(PrivateChannelActions[method](currentUserId));
+        if (typeof result === "string") return result;
+        if (typeof result?.id === "string") return result.id;
+        if (typeof result?.channel?.id === "string") return result.channel.id;
+      } catch {}
+    }
+
+    return null;
+  }
+
+  async function sendDmNotification(change) {
+    if (typeof MessageActions?.sendMessage !== "function") return false;
+
+    const channelId = await createSelfDmChannel();
+    if (!channelId) return false;
+
+    const { title, body } = notificationText(change);
+    try {
+      await Promise.resolve(MessageActions.sendMessage(channelId, { content: `**${PLUGIN_NAME}**\n${title}: ${body}`, tts: false }));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function requestDmNotification(change) {
+    const sent = await sendDmNotification(change);
+    showToast(sent ? `${PLUGIN_NAME}: DM sent.` : `${PLUGIN_NAME}: DM unavailable.`);
+  }
+
+  function showAcknowledgement(change) {
+    const Alert = ReactNative?.Alert;
+    if (typeof Alert?.alert !== "function") return false;
+
+    const { title, body } = notificationText(change);
+    const buttons = [
+      ...(change.kind === "friend" ? [{ text: "Open profile", onPress: () => openMutualProfile(change.id) }] : []),
+      { text: "DM me", onPress: () => void requestDmNotification(change) },
+      { text: "Acknowledge", style: "cancel" },
+    ];
+
+    Alert.alert(title, body, buttons, { cancelable: true });
+    return true;
+  }
+
+  function notifyInApp(change) {
+    const { title, body } = notificationText(change);
+    showToast(`${title}: ${body}`);
+    showAcknowledgement(change);
+    void sendDmNotification(change);
+  }
+
   async function notify(change, { tryAll = false } = {}) {
     const { title, body } = notificationText(change);
     const flatPayload = {
@@ -208,7 +300,7 @@
   function recordChanges(changes) {
     if (!changes.length) return;
     storage.changes = [...changes, ...(storage.changes ?? [])].slice(0, MAX_CHANGES);
-    changes.forEach((change) => void notify(change));
+    changes.forEach(notifyInApp);
   }
 
   function writeSnapshot(friends, guilds) {
