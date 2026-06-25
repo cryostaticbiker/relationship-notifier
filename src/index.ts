@@ -35,9 +35,6 @@ const store = storage as StorageShape;
 const RelationshipStore = findByStoreName("RelationshipStore") ?? findByProps("getRelationships");
 const UserStore = findByStoreName("UserStore") ?? findByProps("getUser");
 const GuildStore = findByStoreName("GuildStore") ?? findByProps("getGuilds");
-const MessageActions = findByProps("sendMessage");
-const PrivateChannelActions =
-  findByProps("ensurePrivateChannel") ?? findByProps("createPrivateChannel") ?? findByProps("openPrivateChannel") ?? findByProps("getPrivateChannelIds");
 const ProfileActions = findByProps("showUserProfile") ?? findByProps("openUserProfile") ?? findByProps("showProfile") ?? findByProps("openProfile");
 
 let interval: ReturnType<typeof setInterval> | undefined;
@@ -167,44 +164,6 @@ function openMutualProfile(userId: string) {
   return true;
 }
 
-async function createSelfDmChannel() {
-  const currentUserId = UserStore?.getCurrentUser?.()?.id;
-  if (!currentUserId) return null;
-
-  for (const method of ["ensurePrivateChannel", "createPrivateChannel", "openPrivateChannel", "getDMFromUserId"]) {
-    if (typeof PrivateChannelActions?.[method] !== "function") continue;
-
-    try {
-      const result = await Promise.resolve(PrivateChannelActions[method](currentUserId));
-      if (typeof result === "string") return result;
-      if (typeof result?.id === "string") return result.id;
-      if (typeof result?.channel?.id === "string") return result.channel.id;
-    } catch {}
-  }
-
-  return null;
-}
-
-async function sendDmNotification(change: ChangeRecord) {
-  if (typeof MessageActions?.sendMessage !== "function") return false;
-
-  const channelId = await createSelfDmChannel();
-  if (!channelId) return false;
-
-  const { title, body } = notificationText(change);
-  try {
-    await Promise.resolve(MessageActions.sendMessage(channelId, { content: `**${PLUGIN_NAME}**\n${title}: ${body}`, tts: false }));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function requestDmNotification(change: ChangeRecord) {
-  const sent = await sendDmNotification(change);
-  showToast(sent ? `${PLUGIN_NAME}: DM sent.` : `${PLUGIN_NAME}: DM unavailable.`);
-}
-
 function showAcknowledgement(change: ChangeRecord) {
   const Alert = ReactNative?.Alert;
   if (typeof Alert?.alert !== "function") return false;
@@ -212,7 +171,6 @@ function showAcknowledgement(change: ChangeRecord) {
   const { title, body } = notificationText(change);
   const buttons = [
     ...(change.kind === "friend" ? [{ text: "Open profile", onPress: () => openMutualProfile(change.id) }] : []),
-    { text: "DM me", onPress: () => void requestDmNotification(change) },
     { text: "Acknowledge", style: "cancel" },
   ];
 
@@ -224,7 +182,6 @@ function notifyInApp(change: ChangeRecord) {
   const { title, body } = notificationText(change);
   showToast(`${title}: ${body}`);
   showAcknowledgement(change);
-  void sendDmNotification(change);
 }
 
 async function notify(change: ChangeRecord, { tryAll = false } = {}) {
