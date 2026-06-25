@@ -5,6 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "verify:local": "node scripts/verify-install-url.mjs file://$PWD/dist/"
+    "verify:local": "node scripts/verify-install-url.mjs file://$PWD/dist/",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^6.0.0"
   }
 }
