@@ -161,6 +161,8 @@ async function notify(change: ChangeRecord, { tryAll = false } = {}) {
     userInfo: { plugin: CHANNEL_ID, kind: change.kind, action: change.action, id: change.id },
   };
 
+  let delivered = false;
+
   for (const target of notificationTargets()) {
     try {
       if (typeof target.requestPermission === "function") await callMaybeAsync(target, "requestPermission");
@@ -171,28 +173,33 @@ async function notify(change: ChangeRecord, { tryAll = false } = {}) {
 
       if (typeof target.displayNotification === "function") {
         await callMaybeAsync(target, "displayNotification", notifeePayload);
-        return;
+        if (!tryAll) return;
+        delivered = true;
       }
       if (typeof target.showNotification === "function") {
         await callMaybeAsync(target, "showNotification", flatPayload);
-        return;
+        if (!tryAll) return;
+        delivered = true;
       }
       if (typeof target.presentLocalNotification === "function") {
         await callMaybeAsync(target, "presentLocalNotification", localPayload);
-        return;
+        if (!tryAll) return;
+        delivered = true;
       }
       if (typeof target.localNotification === "function") {
         await callMaybeAsync(target, "localNotification", localPayload);
-        return;
+        if (!tryAll) return;
+        delivered = true;
       }
       if (typeof target.notify === "function") {
         await callMaybeAsync(target, "notify", flatPayload);
-        return;
+        if (!tryAll) return;
+        delivered = true;
       }
     } catch {}
   }
 
-  showToast(`${title}: ${body}`);
+  if (!delivered || tryAll) showToast(`${title}: ${body}`);
 }
 
 function recordChanges(changes: ChangeRecord[]) {
@@ -275,20 +282,47 @@ function ChangeLogSettings() {
     ["guild-removed", "Server removals"],
   ];
 
+  const refreshLogs = () => {
+    const refreshed = scan();
+    rerender((value: number) => value + 1);
+    showToast(refreshed ? `${PLUGIN_NAME}: refreshed.` : `${PLUGIN_NAME}: stores unavailable.`);
+  };
+
   const clearLogs = () => {
     store.changes = [];
     rerender((value: number) => value + 1);
     showToast(`${PLUGIN_NAME}: logs wiped.`);
   };
   const formatTime = (timestamp: number) =>
-    new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZoneName: "short" }).format(new Date(timestamp));
+    new Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+    }).format(new Date(timestamp));
   const e = React.createElement;
   const { ScrollView, View, Text, Pressable } = ReactNative;
 
   return e(
     ScrollView,
     { style: { padding: 16 } },
-    e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
+    e(
+      View,
+      { style: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 } },
+      e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", flex: 1 } }, PLUGIN_NAME),
+      e(
+        Pressable,
+        {
+          accessibilityLabel: "Refresh change log",
+          onPress: refreshLogs,
+          style: { backgroundColor: "#2f3136", borderRadius: 18, height: 36, width: 36, alignItems: "center", justifyContent: "center", marginLeft: 8 },
+        },
+        e(Text, { style: { color: "white", fontSize: 20, fontWeight: "700" } }, "↻"),
+      ),
+    ),
     e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
     e(
       Pressable,
