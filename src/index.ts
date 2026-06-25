@@ -24,7 +24,7 @@ type StorageShape = {
 };
 
 const PLUGIN_NAME = "Relationship Notifier";
-const STORAGE_VERSION = 3;
+const STORAGE_VERSION = 4;
 const FRIEND_TYPE = 1;
 const SCAN_EVERY_MS = 60_000;
 const DEBOUNCE_MS = 750;
@@ -41,6 +41,10 @@ let debounce: ReturnType<typeof setTimeout> | undefined;
 const listeners: Array<[string, (event: unknown) => void]> = [];
 
 function ensureStorage() {
+  if (store.version !== STORAGE_VERSION) {
+    store.ready = false;
+    store.changes = [];
+  }
   store.version = STORAGE_VERSION;
   store.friends ??= {};
   store.guilds ??= {};
@@ -68,14 +72,16 @@ function friendIds() {
     .map(([id]) => id);
 }
 
-function currentFriends(): Snapshot {
+function currentFriends(): Snapshot | null {
+  if (!RelationshipStore || (!RelationshipStore.getFriendIDs && !RelationshipStore.getFriendIds && !RelationshipStore.getRelationships)) return null;
   const seenAt = Date.now();
   return Object.fromEntries(friendIds().map((id) => [id, { id, label: labelUser(UserStore?.getUser?.(id), id), seenAt }]));
 }
 
-function currentGuilds(): Snapshot {
+function currentGuilds(): Snapshot | null {
+  if (typeof GuildStore?.getGuilds !== "function") return null;
   const seenAt = Date.now();
-  const guilds = typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
+  const guilds = GuildStore.getGuilds();
 
   return Object.fromEntries(Object.entries(guilds).map(([id, guild]) => [id, { id, label: labelGuild(guild, id), seenAt }]));
 }
@@ -136,7 +142,7 @@ function notificationTargets() {
   return [...directCandidates, ...dynamicCandidates].filter(Boolean);
 }
 
-async function notify(change: ChangeRecord) {
+async function notify(change: ChangeRecord, { tryAll = false } = {}) {
   const { title, body } = notificationText(change);
   const flatPayload = { title, body, message: body, channelId: CHANNEL_ID, identifier: change.changeId, smallIcon: "ic_notification" };
   const notifeePayload = {
@@ -207,16 +213,22 @@ function scan({ silent = false } = {}) {
   const friends = currentFriends();
   const guilds = currentGuilds();
 
+  if (!friends || !guilds) return false;
+
   if (store.ready && !silent) {
+    if ((Object.keys(store.friends ?? {}).length && !Object.keys(friends).length) || (Object.keys(store.guilds ?? {}).length && !Object.keys(guilds).length)) {
+      return false;
+    }
     recordChanges([...compare("friend", store.friends, friends), ...compare("guild", store.guilds, guilds)]);
   }
 
   writeSnapshot(friends, guilds);
+  return true;
 }
 
-function scheduleScan() {
+function scheduleScan({ silent = false } = {}) {
   if (debounce) clearTimeout(debounce);
-  debounce = setTimeout(() => scan({ silent: false }), DEBOUNCE_MS);
+  debounce = setTimeout(() => scan({ silent }), DEBOUNCE_MS);
 }
 
 function subscribe(event: string, handler: (event: unknown) => void) {
@@ -236,6 +248,7 @@ function matchesFilter(change: ChangeRecord, filter: FilterValue) {
 }
 
 function sendTestNotification() {
+  showToast(`${PLUGIN_NAME}: sending test notification...`);
   void notify({
     id: "test",
     label: PLUGIN_NAME,
@@ -244,12 +257,13 @@ function sendTestNotification() {
     kind: "friend",
     action: "removed",
     changedAt: Date.now(),
-  });
+  }, { tryAll: true });
 }
 
 function ChangeLogSettings() {
   ensureStorage();
   const [filter, setFilter] = React.useState("all" as FilterValue);
+  const [, rerender] = React.useState(0);
   const changes = (store.changes ?? []).filter((change) => matchesFilter(change, filter));
   const filters: Array<[FilterValue, string]> = [
     ["all", "All"],
@@ -261,6 +275,13 @@ function ChangeLogSettings() {
     ["guild-removed", "Server removals"],
   ];
 
+  const clearLogs = () => {
+    store.changes = [];
+    rerender((value: number) => value + 1);
+    showToast(`${PLUGIN_NAME}: logs wiped.`);
+  };
+  const formatTime = (timestamp: number) =>
+    new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZoneName: "short" }).format(new Date(timestamp));
   const e = React.createElement;
   const { ScrollView, View, Text, Pressable } = ReactNative;
 
@@ -273,6 +294,11 @@ function ChangeLogSettings() {
       Pressable,
       { onPress: sendTestNotification, style: { backgroundColor: "#5865f2", borderRadius: 12, padding: 12, marginBottom: 12 } },
       e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Send test notification"),
+    ),
+    e(
+      Pressable,
+      { onPress: clearLogs, style: { backgroundColor: "#4f3336", borderRadius: 12, padding: 12, marginBottom: 12 } },
+      e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Wipe logs"),
     ),
     e(
       View,
@@ -293,7 +319,7 @@ function ChangeLogSettings() {
             { key: change.changeId, style: { backgroundColor: "#2f3136", borderRadius: 12, marginBottom: 10, padding: 12 } },
             e(Text, { style: { color: "white", fontWeight: "700", marginBottom: 4 } }, title),
             e(Text, { style: { color: "#dcddde", marginBottom: 6 } }, body),
-            e(Text, { style: { color: "#8e9297", fontSize: 12 } }, new Date(change.changedAt).toLocaleString()),
+            e(Text, { style: { color: "#8e9297", fontSize: 12 } }, formatTime(change.changedAt)),
           );
         })
       : e(Text, { style: { color: "#b9bbbe" } }, "No changes recorded for this filter yet."),
@@ -303,12 +329,12 @@ function ChangeLogSettings() {
 export default {
   onLoad() {
     ensureStorage();
-    subscribe("RELATIONSHIP_ADD", scheduleScan);
-    subscribe("RELATIONSHIP_REMOVE", scheduleScan);
-    subscribe("GUILD_CREATE", scheduleScan);
-    subscribe("GUILD_DELETE", scheduleScan);
-    subscribe("CONNECTION_OPEN", scheduleScan);
-    scan({ silent: false });
+    subscribe("RELATIONSHIP_ADD", () => scheduleScan());
+    subscribe("RELATIONSHIP_REMOVE", () => scheduleScan());
+    subscribe("GUILD_CREATE", () => scheduleScan());
+    subscribe("GUILD_DELETE", () => scheduleScan());
+    subscribe("CONNECTION_OPEN", () => scheduleScan({ silent: true }));
+    scan({ silent: true });
     interval = setInterval(scan, SCAN_EVERY_MS);
   },
   onUnload() {

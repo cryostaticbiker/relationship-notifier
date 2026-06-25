@@ -7,7 +7,7 @@ Relationship Notifier is a Revenge-compatible Discord mobile plugin that watches
 - you are added to a server;
 - you are removed from a server.
 
-The plugin also adds a settings page with a filterable change log. You can view all recorded changes or filter to mutual additions, mutual removals, server additions, or server removals.
+The plugin also adds a settings page with a filterable change log. The page starts empty after this schema upgrade, only stores changes detected after a stable baseline exists, and includes a button to wipe the stored logs. You can view all recorded changes or filter to mutual additions, mutual removals, server additions, or server removals.
 
 > Note: mobile clients expose local notification APIs differently. The plugin now tries Notifee-style, React Native local notification, and native module notification bridges first, then falls back to an in-app toast if the current Revenge/Discord build does not expose one. Because Revenge plugins run inside Discord, this is a local/mobile notification while Discord is running, not a remote APNs/FCM server push while the app is fully killed.
 
@@ -119,7 +119,7 @@ Replace `YOUR_GITHUB_USERNAME` and `main` with your GitHub username and branch n
 
 ## Using the settings page
 
-Open the plugin settings in Revenge to view the change log. Use **Send test notification** at the top of the settings page to confirm that your current Discord/Revenge build exposes a native notification bridge. The available filters are:
+Open the plugin settings in Revenge to view the change log. Use **Send test notification** at the top of the settings page to confirm that your current Discord/Revenge build exposes a native notification bridge, and use **Wipe logs** to clear stored history without changing the current baseline. Times are formatted with the device/user timezone. The available filters are:
 
 - **All**: every recorded mutual and server change;
 - **Mutuals**: all mutual additions and removals;
@@ -129,4 +129,4 @@ Open the plugin settings in Revenge to view the change log. Use **Send test noti
 - **Server adds**: only servers that appeared in your guild list;
 - **Server removals**: only servers that disappeared from your guild list.
 
-The first plugin load creates a baseline and does not alert for existing mutuals or servers. Changes are recorded after that baseline exists. The log keeps the newest 250 entries on the device in Revenge plugin storage.
+The first plugin load creates a baseline and does not alert for existing mutuals or servers. App reconnect/open scans refresh the baseline silently so opening Revenge does not create fake add/remove entries. Changes are recorded after that baseline exists. The log keeps the newest 250 entries on the device in Revenge plugin storage unless you wipe it from settings.

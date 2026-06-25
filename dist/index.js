@@ -1,6 +1,6 @@
 (() => {
   const PLUGIN_NAME = "Relationship Notifier";
-  const STORAGE_VERSION = 3;
+  const STORAGE_VERSION = 4;
   const FRIEND_TYPE = 1;
   const SCAN_EVERY_MS = 60_000;
   const DEBOUNCE_MS = 750;
@@ -24,6 +24,10 @@
   const GuildStore = byStore("GuildStore", "getGuilds");
 
   function ensureStorage() {
+    if (storage.version !== STORAGE_VERSION) {
+      storage.ready = false;
+      storage.changes = [];
+    }
     storage.version = STORAGE_VERSION;
     storage.friends ??= {};
     storage.guilds ??= {};
@@ -53,6 +57,7 @@
   }
 
   function currentFriends() {
+    if (!RelationshipStore || (!RelationshipStore.getFriendIDs && !RelationshipStore.getFriendIds && !RelationshipStore.getRelationships)) return null;
     const seenAt = Date.now();
     return Object.fromEntries(
       friendIds().map((id) => [id, { id, label: labelUser(UserStore?.getUser?.(id), id), seenAt }]),
@@ -60,8 +65,9 @@
   }
 
   function currentGuilds() {
+    if (typeof GuildStore?.getGuilds !== "function") return null;
     const seenAt = Date.now();
-    const guilds = typeof GuildStore?.getGuilds === "function" ? GuildStore.getGuilds() : {};
+    const guilds = GuildStore.getGuilds();
 
     return Object.fromEntries(
       Object.entries(guilds).map(([id, guild]) => [id, { id, label: labelGuild(guild, id), seenAt }]),
@@ -131,7 +137,7 @@
     return [...directCandidates, ...dynamicCandidates].filter(Boolean);
   }
 
-  async function notify(change) {
+  async function notify(change, { tryAll = false } = {}) {
     const { title, body } = notificationText(change);
     const flatPayload = {
       title,
@@ -167,23 +173,23 @@
 
         if (typeof target.displayNotification === "function") {
           await callMaybeAsync(target, "displayNotification", notifeePayload);
-          return;
+          if (!tryAll) return;
         }
         if (typeof target.showNotification === "function") {
           await callMaybeAsync(target, "showNotification", flatPayload);
-          return;
+          if (!tryAll) return;
         }
         if (typeof target.presentLocalNotification === "function") {
           await callMaybeAsync(target, "presentLocalNotification", localPayload);
-          return;
+          if (!tryAll) return;
         }
         if (typeof target.localNotification === "function") {
           await callMaybeAsync(target, "localNotification", localPayload);
-          return;
+          if (!tryAll) return;
         }
         if (typeof target.notify === "function") {
           await callMaybeAsync(target, "notify", flatPayload);
-          return;
+          if (!tryAll) return;
         }
       } catch {}
     }
@@ -208,16 +214,22 @@
     const friends = currentFriends();
     const guilds = currentGuilds();
 
+    if (!friends || !guilds) return false;
+
     if (storage.ready && !silent) {
+      if ((Object.keys(storage.friends ?? {}).length && !Object.keys(friends).length) || (Object.keys(storage.guilds ?? {}).length && !Object.keys(guilds).length)) {
+        return false;
+      }
       recordChanges([...compare("friend", storage.friends, friends), ...compare("guild", storage.guilds, guilds)]);
     }
 
     writeSnapshot(friends, guilds);
+    return true;
   }
 
-  function scheduleScan() {
+  function scheduleScan({ silent = false } = {}) {
     clearTimeout(debounce);
-    debounce = setTimeout(() => scan({ silent: false }), DEBOUNCE_MS);
+    debounce = setTimeout(() => scan({ silent }), DEBOUNCE_MS);
   }
 
   function subscribe(event, handler) {
@@ -237,6 +249,7 @@
   }
 
   function sendTestNotification() {
+    showToast(`${PLUGIN_NAME}: sending test notification...`);
     void notify({
       id: "test",
       label: PLUGIN_NAME,
@@ -245,12 +258,13 @@
       kind: "friend",
       action: "removed",
       changedAt: Date.now(),
-    });
+    }, { tryAll: true });
   }
 
   function ChangeLogSettings() {
     ensureStorage();
     const [filter, setFilter] = React.useState("all");
+    const [, rerender] = React.useState(0);
     const changes = (storage.changes ?? []).filter((change) => matchesFilter(change, filter));
     const filters = [
       ["all", "All"],
@@ -261,6 +275,13 @@
       ["guild-added", "Server adds"],
       ["guild-removed", "Server removals"],
     ];
+    const clearLogs = () => {
+      storage.changes = [];
+      rerender((value) => value + 1);
+      showToast(`${PLUGIN_NAME}: logs wiped.`);
+    };
+    const formatTime = (timestamp) =>
+      new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZoneName: "short" }).format(new Date(timestamp));
     const e = React.createElement;
     const { ScrollView, View, Text, Pressable } = ReactNative;
 
@@ -273,6 +294,11 @@
         Pressable,
         { onPress: sendTestNotification, style: { backgroundColor: "#5865f2", borderRadius: 12, padding: 12, marginBottom: 12 } },
         e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Send test notification"),
+      ),
+      e(
+        Pressable,
+        { onPress: clearLogs, style: { backgroundColor: "#4f3336", borderRadius: 12, padding: 12, marginBottom: 12 } },
+        e(Text, { style: { color: "white", fontWeight: "700", textAlign: "center" } }, "Wipe logs"),
       ),
       e(
         View,
@@ -302,7 +328,7 @@
               { key: change.changeId, style: { backgroundColor: "#2f3136", borderRadius: 12, marginBottom: 10, padding: 12 } },
               e(Text, { style: { color: "white", fontWeight: "700", marginBottom: 4 } }, title),
               e(Text, { style: { color: "#dcddde", marginBottom: 6 } }, body),
-              e(Text, { style: { color: "#8e9297", fontSize: 12 } }, new Date(change.changedAt).toLocaleString()),
+              e(Text, { style: { color: "#8e9297", fontSize: 12 } }, formatTime(change.changedAt)),
             );
           })
         : e(Text, { style: { color: "#b9bbbe" } }, "No changes recorded for this filter yet."),
@@ -312,12 +338,12 @@
   return {
     onLoad() {
       ensureStorage();
-      subscribe("RELATIONSHIP_ADD", scheduleScan);
-      subscribe("RELATIONSHIP_REMOVE", scheduleScan);
-      subscribe("GUILD_CREATE", scheduleScan);
-      subscribe("GUILD_DELETE", scheduleScan);
-      subscribe("CONNECTION_OPEN", scheduleScan);
-      scan({ silent: false });
+      subscribe("RELATIONSHIP_ADD", () => scheduleScan());
+      subscribe("RELATIONSHIP_REMOVE", () => scheduleScan());
+      subscribe("GUILD_CREATE", () => scheduleScan());
+      subscribe("GUILD_DELETE", () => scheduleScan());
+      subscribe("CONNECTION_OPEN", () => scheduleScan({ silent: true }));
+      scan({ silent: true });
       interval = setInterval(scan, SCAN_EVERY_MS);
     },
 
