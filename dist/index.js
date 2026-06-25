@@ -284,6 +284,12 @@
       ["guild-added", "Server adds"],
       ["guild-removed", "Server removals"],
     ];
+    const refreshLogs = () => {
+      const refreshed = scan();
+      rerender((value) => value + 1);
+      showToast(refreshed ? `${PLUGIN_NAME}: refreshed.` : `${PLUGIN_NAME}: stores unavailable.`);
+    };
+
     const clearLogs = () => {
       storage.changes = [];
       rerender((value) => value + 1);
@@ -305,7 +311,20 @@
     return e(
       ScrollView,
       { style: { padding: 16 } },
-      e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", marginBottom: 8 } }, PLUGIN_NAME),
+      e(
+        View,
+        { style: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 } },
+        e(Text, { style: { color: "white", fontSize: 22, fontWeight: "700", flex: 1 } }, PLUGIN_NAME),
+        e(
+          Pressable,
+          {
+            accessibilityLabel: "Refresh change log",
+            onPress: refreshLogs,
+            style: { backgroundColor: "#2f3136", borderRadius: 18, height: 36, width: 36, alignItems: "center", justifyContent: "center", marginLeft: 8 },
+          },
+          e(Text, { style: { color: "white", fontSize: 20, fontWeight: "700" } }, "↻"),
+        ),
+      ),
       e(Text, { style: { color: "#b9bbbe", marginBottom: 12 } }, "Review every recorded mutual and server addition or removal."),
       e(
         Pressable,
