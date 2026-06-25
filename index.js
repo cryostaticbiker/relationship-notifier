@@ -193,8 +193,6 @@
         }
       } catch {}
     }
-
-    showToast(`${title}: ${body}`);
   }
 
 
